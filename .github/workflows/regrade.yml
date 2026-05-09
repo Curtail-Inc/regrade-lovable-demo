@@ -67,8 +67,11 @@ jobs:
           set -eu
           apk add --no-cache curl ca-certificates bash
           curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
-          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" -o /tmp/regrade.sha256
-          cd /usr/local/bin && sha256sum -c /tmp/regrade.sha256
+          # The published .sha256 references the versioned filename (e.g.
+          # regrade-3.0.0-linux-x86_64), so reconstruct the line against the
+          # local path before piping into sha256sum -c.
+          EXPECTED=$(curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" | awk '{print $1}')
+          echo "${EXPECTED}  /usr/local/bin/regrade" | sha256sum -c -
           chmod +x /usr/local/bin/regrade
       - name: Record baseline traffic
         shell: bash
@@ -121,10 +124,13 @@ jobs:
           set -eu
           apk add --no-cache curl ca-certificates python3 py3-pip git bash
           curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
-          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" -o /tmp/regrade.sha256
           curl -fsSL "${DOWNLOADS_URL}/regrade-analyze" -o /usr/local/bin/regrade-analyze
-          curl -fsSL "${DOWNLOADS_URL}/regrade-analyze.sha256" -o /tmp/regrade-analyze.sha256
-          cd /usr/local/bin && sha256sum -c /tmp/regrade.sha256 && sha256sum -c /tmp/regrade-analyze.sha256
+          # The published .sha256 files reference versioned filenames; reconstruct
+          # the lines against local paths before piping into sha256sum -c.
+          REGRADE_HASH=$(curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" | awk '{print $1}')
+          ANALYZE_HASH=$(curl -fsSL "${DOWNLOADS_URL}/regrade-analyze.sha256" | awk '{print $1}')
+          printf '%s  /usr/local/bin/regrade\n%s  /usr/local/bin/regrade-analyze\n' "$REGRADE_HASH" "$ANALYZE_HASH" \
+            | sha256sum -c -
           chmod +x /usr/local/bin/regrade /usr/local/bin/regrade-analyze
           pip install --break-system-packages --quiet \
             'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
