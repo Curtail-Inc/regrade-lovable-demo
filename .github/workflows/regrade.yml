@@ -126,7 +126,10 @@ jobs:
           - 8080
     env:
       REGRADE_API_KEY: ${{ secrets.REGRADE_API_KEY }}
-      REGRADE_PROFILE: notes-demo
+      # Set this to your profile name once you've bootstrapped one with
+      # `regrade refine-profile <replay-id>`. Until then, replay runs
+      # unfiltered and the analyze step is skipped.
+      REGRADE_PROFILE: ${{ vars.REGRADE_PROFILE }}
       GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_TOKEN: ${{ github.token }}
@@ -155,10 +158,19 @@ jobs:
           regrade replay \
             --tag git_branch=main --tag ci=true \
             --target http://app-under-test:8080 \
-            --profile "$REGRADE_PROFILE" \
+            ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
             --replay-tag commit="$GITHUB_SHA" \
             --replay-tag pipeline="$GITHUB_RUN_ID" \
             --quiet
       - name: Classify deltas and post PR comment
+        if: env.REGRADE_PROFILE != ''
         shell: sh
         run: regrade-analyze
+      - name: Note that analyze was skipped
+        if: env.REGRADE_PROFILE == ''
+        run: |
+          echo "::notice::REGRADE_PROFILE is not set; skipping regrade-analyze."
+          echo "::notice::Replay completed — view deltas at the recording URL above."
+          echo "::notice::To enable PR comments, bootstrap a profile interactively with"
+          echo "::notice::  regrade refine-profile <replay-id>"
+          echo "::notice::then set the REGRADE_PROFILE repository variable."
