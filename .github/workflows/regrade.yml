@@ -97,7 +97,11 @@ jobs:
             exit 1
           fi
 
-          export HTTP_PROXY=http://localhost:8888
+          # curl deliberately ignores HTTP_PROXY (uppercase) per the httpoxy
+          # CVE mitigation — only http_proxy (lowercase) is honored. Set both
+          # so other clients with stricter rules also pick it up.
+          export http_proxy=http://localhost:8888
+          export https_proxy=http://localhost:8888
           export REGRADE_TARGET_URL=http://app-under-test:8080
 
           bash tests.sh
