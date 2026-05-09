@@ -89,10 +89,8 @@ async function handle(req: Request): Promise<Response> {
     const id = Number(noteMatch[1]);
     const note = NOTES.find((n) => n.id === id);
     if (!note) return json(404, { error: "not found" });
-    // Auth gate: caller must own the note OR the note must be public.
-    if (note.owner_id !== auth.id && note.visibility === "private") {
-      return json(403, { error: "forbidden" });
-    }
+    // BUG (intentional, for the demo): the auth gate has been removed,
+    // so any authenticated user can read any private note.
     return json(200, { note });
   }
 
