@@ -1,0 +1,144 @@
+# ABOUTME: ReGrade differential testing for the notes app.
+# ABOUTME: Builds the app, records baseline traffic on main, replays on PRs.
+
+name: ReGrade
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  packages: write
+
+env:
+  REGRADE_API_URL: https://api.regrade.curtail.com/api/v1
+  DOWNLOADS_URL: https://app.regrade.curtail.com/downloads/latest
+
+jobs:
+  build-app:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: |
+          # ghcr requires lowercase repo path
+          REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${REPO}:${GITHUB_SHA}" >> $GITHUB_OUTPUT
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  regrade-record:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-app
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    services:
+      app-under-test:
+        image: ${{ needs.build-app.outputs.image }}
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        ports:
+          - 8080
+    env:
+      REGRADE_API_KEY: ${{ secrets.REGRADE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ReGrade sensor
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache curl ca-certificates bash
+          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
+          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" -o /tmp/regrade.sha256
+          cd /usr/local/bin && sha256sum -c /tmp/regrade.sha256
+          chmod +x /usr/local/bin/regrade
+      - name: Record baseline traffic
+        shell: bash
+        run: |
+          set -eu
+          regrade proxy \
+            --target http://app-under-test:8080 \
+            --port 8888 \
+            --git-sha "$GITHUB_SHA" \
+            --git-branch main \
+            --tag ci=true \
+            --tag pipeline="$GITHUB_RUN_ID" \
+            --tag git_branch=main &
+          PROXY_PID=$!
+          sleep 2
+
+          export HTTP_PROXY=http://localhost:8888
+          export REGRADE_TARGET_URL=http://app-under-test:8080
+
+          bash tests.sh
+
+          kill -TERM $PROXY_PID && wait $PROXY_PID || true
+
+  regrade-replay:
+    if: github.event_name == 'pull_request'
+    needs: build-app
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: alpine:latest
+    services:
+      app-under-test:
+        image: ${{ needs.build-app.outputs.image }}
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        ports:
+          - 8080
+    env:
+      REGRADE_API_KEY: ${{ secrets.REGRADE_API_KEY }}
+      REGRADE_PROFILE: notes-demo
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ReGrade sensor and analyze script
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache curl ca-certificates python3 py3-pip git bash
+          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
+          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" -o /tmp/regrade.sha256
+          curl -fsSL "${DOWNLOADS_URL}/regrade-analyze" -o /usr/local/bin/regrade-analyze
+          curl -fsSL "${DOWNLOADS_URL}/regrade-analyze.sha256" -o /tmp/regrade-analyze.sha256
+          cd /usr/local/bin && sha256sum -c /tmp/regrade.sha256 && sha256sum -c /tmp/regrade-analyze.sha256
+          chmod +x /usr/local/bin/regrade /usr/local/bin/regrade-analyze
+          pip install --break-system-packages --quiet \
+            'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
+      - name: Replay baseline against PR head
+        shell: bash
+        run: |
+          set -eu
+          regrade replay \
+            --tag git_branch=main --tag ci=true \
+            --target http://app-under-test:8080 \
+            --profile "$REGRADE_PROFILE" \
+            --replay-tag commit="$GITHUB_SHA" \
+            --replay-tag pipeline="$GITHUB_RUN_ID" \
+            --quiet
+      - name: Classify deltas and post PR comment
+        shell: sh
+        run: regrade-analyze
