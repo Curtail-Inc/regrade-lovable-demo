@@ -88,12 +88,22 @@ jobs:
           PROXY_PID=$!
           sleep 2
 
+          # set -e doesn't catch background-process failures, so verify the
+          # proxy is actually alive before sending traffic. Without this,
+          # tests.sh runs through, curl talks direct to the app, the job
+          # exits 0, but ReGrade gets no recording — pure silent failure.
+          if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            echo "FATAL: regrade proxy failed to start (likely missing REGRADE_API_KEY)" >&2
+            exit 1
+          fi
+
           export HTTP_PROXY=http://localhost:8888
           export REGRADE_TARGET_URL=http://app-under-test:8080
 
           bash tests.sh
 
-          kill -TERM $PROXY_PID && wait $PROXY_PID || true
+          kill -TERM "$PROXY_PID"
+          wait "$PROXY_PID" || true
 
   regrade-replay:
     if: github.event_name == 'pull_request'
