@@ -155,13 +155,14 @@ jobs:
         shell: bash
         run: |
           set -eu
+          # No --quiet: we want the delta summary visible in the job log so
+          # reviewers can see what ReGrade found without leaving GitHub.
           regrade replay \
             --tag git_branch=main --tag ci=true \
             --target http://app-under-test:8080 \
             ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
             --replay-tag commit="$GITHUB_SHA" \
-            --replay-tag pipeline="$GITHUB_RUN_ID" \
-            --quiet
+            --replay-tag pipeline="$GITHUB_RUN_ID"
       - name: Classify deltas and post PR comment
         if: env.REGRADE_PROFILE != ''
         shell: sh
