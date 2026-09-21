@@ -338,17 +338,32 @@ jobs:
           set -eu
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
-          regrade_phase "1/3" "replay" "Re-sending the newest $GITHUB_BASE_REF recording against http://app-under-test:${{ inputs.app-port }} through profile $REGRADE_PROFILE, to compare this commit's responses with the baseline"
+          regrade_phase "1/3" "replay" "Re-sending the newest $GITHUB_BASE_REF recording against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          # Written to a file and echoed, rather than piped into tee: this
+          # shell has no pipefail, so a pipeline reports tee's status and a
+          # replay that died on a server error would read as success.
+          #
           # --quiet suppresses per-request chatter only. The delta breakdown at
-          # the end is printed, not logged, so it survives. tee keeps a copy:
-          # the breakdown is the one place the labeled/unlabeled split exists.
-          if regrade replay \
+          # the end is printed, not logged, so it survives. The file keeps a
+          # copy: the breakdown is the one place the labeled/unlabeled split
+          # exists.
+          #
+          # --profile only when there is one. An empty profile name is not a
+          # request for "no profile", it is a request for a profile called ""
+          # and the API has no reason to find one. The GitLab template has
+          # always omitted it this way.
+          set +e
+          regrade replay \
             --tag git_branch="${GITHUB_BASE_REF}" --tag ci=true \
             --target http://app-under-test:${{ inputs.app-port }} \
-            --profile "$REGRADE_PROFILE" \
+            ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
             --replay-tag commit="$GITHUB_SHA" \
             --replay-tag pipeline="$GITHUB_RUN_ID" \
-            --quiet 2>&1 | tee regrade-summary/replay-output.txt; then
+            --quiet > regrade-summary/replay-output.txt 2>&1
+          replay_status=$?
+          set -e
+          cat regrade-summary/replay-output.txt
+          if [ "$replay_status" -eq 0 ]; then
             # The sensor's own block is the only place the labeled/unlabeled
             # split exists, so the phase line quotes it back.
             SUMMARY=$(awk -F': +' '
