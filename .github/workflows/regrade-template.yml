@@ -34,6 +34,11 @@ on:
         description: "Docker image of application under test (must be pullable from the runner)"
         required: true
         type: string
+      job-image:
+        description: "Image the record job runs in, which is where test-command executes. Override when your suite needs more than busybox (bash, node, python). Must be able to run test-command."
+        required: false
+        type: string
+        default: "alpine:latest"
       registry-username:
         description: "Username for the registry holding app-image. Leave empty for a public image."
         required: false
@@ -89,7 +94,9 @@ jobs:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     container:
-      image: alpine:latest
+      # The test command runs in this container, so the caller chooses it.
+      # Alpine by default, which is enough for a curl-based suite.
+      image: ${{ inputs.job-image }}
     services:
       app-under-test:
         image: ${{ inputs.app-image }}
@@ -105,11 +112,19 @@ jobs:
       REGRADE_API_URL: ${{ inputs.api-url }}
       REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
     steps:
+      # GitLab clones the repository for a job; GitHub does not. Without this
+      # the caller's test command has nothing to run against.
+      - uses: actions/checkout@v4
       - name: Install ReGrade sensor
         shell: sh
         run: |
           set -eu
-          apk add --no-cache curl ca-certificates
+          # The job image is the caller's choice, so do not assume a package
+          # manager, and install nothing when curl is already there.
+          command -v curl >/dev/null 2>&1 || \
+            (command -v apk >/dev/null 2>&1 && apk add --no-cache curl ca-certificates) || \
+            (command -v apt-get >/dev/null 2>&1 && apt-get update -qq && apt-get install -y -qq curl ca-certificates) || \
+            { echo "curl not found and no supported package manager; add curl to job-image"; exit 1; }
           curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64" -o /usr/local/bin/regrade
           # The published .sha256 references the versioned filename (e.g.
           # regrade-3.0.0-linux-x86_64), not /usr/local/bin/regrade.
@@ -260,6 +275,11 @@ jobs:
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
+      # analyze compares deltas against the code that changed, so it needs the
+      # repository and its history, not just the working tree.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install ReGrade sensor and analyze script
         shell: sh
         run: |
