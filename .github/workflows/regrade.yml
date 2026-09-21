@@ -63,13 +63,12 @@ jobs:
       # The image is published to this repository's own ghcr namespace, which
       # is private, so the template needs credentials to pull it as a service.
       registry-username: ${{ github.actor }}
-      # No profile yet. The replay still runs and still reports its deltas,
-      # but regrade-analyze refuses to sort them without one, because every
-      # rotating id and timestamp would count as a difference. So the analyze
-      # step ends amber with "could not analyze this run" and, with the gate
-      # off, does not block. Set a profile name here to get the triage and the
-      # pull request comment.
-      profile: ""
+      # Every response carries a served_at timestamp, so without a profile all
+      # 19 of them differ and the one difference that matters is buried. This
+      # profile drops that one path and nothing else, which is what turns 20
+      # deltas into 1. x-request-id needs no rule: the sensor already treats it
+      # as noise (DEFAULT_NOISY_RESPONSE_HEADERS).
+      profile: "notes-demo"
       fail-on-deltas: false
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
