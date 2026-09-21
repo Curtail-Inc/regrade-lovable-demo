@@ -56,7 +56,10 @@ jobs:
     with:
       app-image: ${{ needs.build-app.outputs.image }}
       app-port: "8080"
-      test-command: "bash tests.sh"
+      # sh, not bash: the template runs the test command inside its own job
+      # container, which is Alpine and has no bash. tests.sh is POSIX-clean
+      # (shellcheck -s sh passes), so it runs unchanged.
+      test-command: "sh tests.sh"
       # The image is published to this repository's own ghcr namespace, which
       # is private, so the template needs credentials to pull it as a service.
       registry-username: ${{ github.actor }}
