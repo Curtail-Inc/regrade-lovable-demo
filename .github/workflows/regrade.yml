@@ -63,8 +63,12 @@ jobs:
       # The image is published to this repository's own ghcr namespace, which
       # is private, so the template needs credentials to pull it as a service.
       registry-username: ${{ github.actor }}
-      # No profile yet: every difference from the baseline is reported until
-      # one exists. Set it here once a profile has been created.
+      # No profile yet. The replay still runs and still reports its deltas,
+      # but regrade-analyze refuses to sort them without one, because every
+      # rotating id and timestamp would count as a difference. So the analyze
+      # step ends amber with "could not analyze this run" and, with the gate
+      # off, does not block. Set a profile name here to get the triage and the
+      # pull request comment.
       profile: ""
       fail-on-deltas: false
     secrets:

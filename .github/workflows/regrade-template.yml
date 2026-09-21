@@ -394,15 +394,32 @@ jobs:
             # Gate off: surface the analyze exit code untouched. continue-on-error
             # keeps it from failing the workflow, and a customer watching for a red
             # step as their outage signal still sees one.
-            if [ "$code" -eq 0 ]; then
-              regrade_phase_done ok "no delta needs a human decision"
-              regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
-                "the ReGrade comment on this pull request"
-            else
-              regrade_phase_done failed "analyze exited $code"
-              regrade_verdict WARN "Deltas need a human decision, but the gate is off so this does not block the pull request" \
-                "the ReGrade comment on this pull request"
-            fi
+            # The arms are enumerated here for the same reason they are below:
+            # "analyze refused to run" and "analyze judged the deltas and found
+            # unexplained ones" are opposite facts, and reporting the first as
+            # the second tells the reader a comparison happened that did not.
+            case "$code" in
+              0)
+                regrade_phase_done ok "no delta needs a human decision"
+                regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
+                  "the ReGrade comment on this pull request"
+                ;;
+              1)
+                regrade_phase_done failed "analysis could not run (exit 1)"
+                regrade_verdict WARN "ReGrade could not analyze this run, so nothing was judged and no delta was ruled out" \
+                  "the analyze step log on this run page"
+                ;;
+              3)
+                regrade_phase_done failed "deltas still need a human decision (exit 3)"
+                regrade_verdict WARN "Deltas need a human decision, but the gate is off so this does not block the pull request" \
+                  "the ReGrade comment on this pull request"
+                ;;
+              *)
+                regrade_phase_done failed "analyze exited $code"
+                regrade_verdict WARN "The analysis step itself failed, so this run was never judged. The gate is off, so the pull request is not blocked" \
+                  "the analyze step log on this run page"
+                ;;
+            esac
             exit $code
           fi
           # Gate on: continue-on-error is boolean only, so the exit-code split is
