@@ -29,16 +29,21 @@ const NOTES: Note[] = [
   { id: 5, owner_id: "u_charlie", title: "charlie secret", body: "charlie's private thoughts", visibility: "private" },
 ];
 
-// Bearer tokens are username:password base64 — trivial for the demo, NOT for production.
-const tokenForUser = (u: User) => btoa(`${u.username}:${u.password}`);
-const userFromToken = (token: string): User | null => {
-  try {
-    const [username, password] = atob(token).split(":");
-    return USERS.find((u) => u.username === username && u.password === password) ?? null;
-  } catch {
-    return null;
-  }
+// Session tokens are minted at login and live only in this process, the way a
+// real session store behaves. A token from an earlier run does not exist here,
+// so it is rejected.
+//
+// That is what makes this demo honest about profiles. A replay sends the token
+// it recorded, which this process has never issued, and every authenticated
+// request comes back 401 unless the profile carries an id mapping teaching the
+// sensor to swap the recorded token for the freshly minted one.
+const SESSIONS = new Map<string, User>();
+const tokenForUser = (u: User) => {
+  const token = crypto.randomUUID();
+  SESSIONS.set(token, u);
+  return token;
 };
+const userFromToken = (token: string): User | null => SESSIONS.get(token) ?? null;
 
 // Every response carries the time it was served and a fresh request id, the
 // way most real APIs do. Both change on every single call, so a replay
