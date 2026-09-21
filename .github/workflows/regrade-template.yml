@@ -1,0 +1,419 @@
+# ABOUTME: Reusable GitHub Actions workflow for ReGrade differential testing.
+# ABOUTME: Provides record-on-default-branch and replay-on-PR jobs for customer pipelines.
+#
+# Usage from a caller workflow:
+#
+#   name: ReGrade
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#   permissions:
+#     contents: read
+#     pull-requests: write   # required for replay job to post the analysis comment
+#   jobs:
+#     regrade:
+#       uses: curtail/regrade3/.github/workflows/regrade.yml@main
+#       with:
+#         app-image: ghcr.io/your-org/your-app:${{ github.sha }}
+#         app-port: '8080'
+#         test-command: 'sh tests.sh'
+#         profile: my-profile
+#       secrets:
+#         regrade-api-key: ${{ secrets.REGRADE_API_KEY }}
+#
+# The CLI and analyze script are downloaded at job start from
+# app.regrade.curtail.com — no custom container image is required.
+
+name: ReGrade Differential Testing
+
+on:
+  workflow_call:
+    inputs:
+      app-image:
+        description: "Docker image of application under test (must be pullable from the runner)"
+        required: true
+        type: string
+      registry-username:
+        description: "Username for the registry holding app-image. Leave empty for a public image."
+        required: false
+        type: string
+        default: ""
+      app-port:
+        description: "Port the application listens on"
+        required: false
+        type: string
+        default: "8080"
+      test-command:
+        description: "Command to run test suite (auto-proxied via http_proxy)"
+        required: true
+        type: string
+      profile:
+        description: "ReGrade profile name for noise filtering"
+        required: true
+        type: string
+      api-url:
+        description: "ReGrade API URL"
+        required: false
+        type: string
+        default: "https://api.regrade.curtail.com/api/v1"
+      downloads-url:
+        description: "Base URL for the ReGrade downloads (sensor binary + analyze script)"
+        required: false
+        type: string
+        default: "https://app.regrade.curtail.com/downloads/latest"
+      enable-llm:
+        description: "Enable LLM-powered delta classification (sends delta summaries to LLM provider)"
+        required: false
+        type: boolean
+        default: false
+      fail-on-deltas:
+        description: "Fail the workflow when any delta still needs a human decision (unlabeled, suspicious status change, or security finding). An analysis that could not run is reported as a warning and does not block."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      registry-password:
+        description: "Password or token for registry-username. Leave unset for a public image."
+        required: false
+      regrade-api-key:
+        description: "ReGrade API key for sensor authentication"
+        required: true
+      llm-api-key:
+        description: "LLM provider API key, required when enable-llm is true"
+        required: false
+
+jobs:
+  # Record baseline on default-branch pushes
+  regrade-record:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    services:
+      app-under-test:
+        image: ${{ inputs.app-image }}
+        # Most real applications live in a private registry. A workflow cannot
+        # omit a key conditionally, so credentials are always present and empty
+        # when the caller passes none, which is how a public image is pulled.
+        credentials:
+          username: ${{ inputs.registry-username }}
+          password: ${{ secrets.registry-password }}
+        ports:
+          - ${{ inputs.app-port }}
+    env:
+      REGRADE_API_URL: ${{ inputs.api-url }}
+      REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
+    steps:
+      - name: Install ReGrade sensor
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache curl ca-certificates
+          curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64" -o /usr/local/bin/regrade
+          # The published .sha256 references the versioned filename (e.g.
+          # regrade-3.0.0-linux-x86_64), not /usr/local/bin/regrade.
+          # Reconstruct the line against the local path before sha256sum -c.
+          EXPECTED=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64.sha256" | awk '{print $1}')
+          echo "${EXPECTED}  /usr/local/bin/regrade" | sha256sum -c -
+          chmod +x /usr/local/bin/regrade
+
+          # Phase reporting, written to a file because each step gets its own
+          # shell. Same output as the GitLab template: what is about to happen,
+          # how it went and how long it took, then a verdict naming the rule
+          # that decided the run. The verdict also lands on the run summary
+          # page, where someone who did not open the log will see it.
+          cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
+          regrade_phase() {  # <n/total> <name> <what is about to happen>
+            REGRADE_PHASE_NAME="$2"
+            REGRADE_PHASE_STARTED=$(date +%s)
+            printf '\n=== ReGrade %s: %s ===\n' "$1" "$2"
+            printf '    %s\n' "$3"
+          }
+          regrade_phase_done() {  # <ok|failed> <one line of result>
+            _regrade_elapsed=$(( $(date +%s) - ${REGRADE_PHASE_STARTED:-0} ))
+            if [ "$1" = ok ]; then _regrade_mark='[ok]    '; else _regrade_mark='[FAILED]'; fi
+            printf '%s %s took %dm%02ds: %s\n' "$_regrade_mark" "$REGRADE_PHASE_NAME" \
+              "$(( _regrade_elapsed / 60 ))" "$(( _regrade_elapsed % 60 ))" "$2"
+          }
+          regrade_verdict() {  # <PASS|FAIL|WARN> <why> <where to look>
+            printf '\n=== ReGrade verdict: %s ===\n' "$1"
+            printf '    %s\n' "$2"
+            printf '    Gate: REGRADE_FAIL_ON_DELTAS=%s (true means a delta needing a human decision fails this job)\n' \
+              "${REGRADE_FAIL_ON_DELTAS:-false}"
+            printf '    Report: %s\n' "$3"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### ReGrade verdict: %s\n\n%s\n\nGate: REGRADE_FAIL_ON_DELTAS=%s. Report: %s\n' \
+                "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          PHASE_HELPERS
+
+      - name: Record baseline traffic
+        shell: sh
+        run: |
+          set -eu
+          . /tmp/regrade-phase.sh
+          regrade_phase "1/2" "capture" "Recording every request the test suite makes, through the proxy on port 8888 to http://app-under-test:${{ inputs.app-port }}, tagged pipeline=$GITHUB_RUN_ID"
+          regrade proxy \
+            --target http://app-under-test:${{ inputs.app-port }} \
+            --port 8888 \
+            --git-sha "$GITHUB_SHA" \
+            --git-branch "${GITHUB_REF#refs/heads/}" \
+            --tag ci=true \
+            --tag pipeline="$GITHUB_RUN_ID" \
+            --tag git_branch="${GITHUB_REF#refs/heads/}" &
+          PROXY_PID=$!
+          sleep 2
+
+          # set -e doesn't catch background-process failures. Without this
+          # check, a dead proxy (e.g. missing REGRADE_API_KEY) lets the test
+          # suite run with http_proxy pointing at nothing — curl falls through
+          # to direct, the job exits 0, and ReGrade gets no recording. Silent
+          # failure.
+          if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            echo "FATAL: regrade proxy failed to start (likely missing REGRADE_API_KEY)" >&2
+            exit 1
+          fi
+
+          # curl deliberately ignores HTTP_PROXY (uppercase) per the httpoxy
+          # CVE mitigation — only http_proxy (lowercase) is honored. We set
+          # both forms; lowercase is the one that actually matters for
+          # curl-based clients.
+          export http_proxy=http://localhost:8888
+          export https_proxy=http://localhost:8888
+          export HTTPS_PROXY=http://localhost:8888
+          export REGRADE_PROXY_URL=http://localhost:8888
+          export REGRADE_TARGET_URL=http://app-under-test:${{ inputs.app-port }}
+
+          ${{ inputs.test-command }}
+
+          kill -TERM "$PROXY_PID"
+          wait "$PROXY_PID" || true
+          regrade_phase_done ok "test suite finished and the sensor uploaded what it captured"
+
+      # actions/upload-artifact cannot run in this job: the runner injects a
+      # glibc-linked Node binary to execute JavaScript actions and this
+      # container is Alpine (musl), so the action fails outright.
+      # $GITHUB_STEP_SUMMARY is a plain file, so shell can write the same
+      # information to the run page without an action.
+      - name: Publish recording summary
+        if: always()
+        shell: sh
+        run: |
+          set -eu
+          . /tmp/regrade-phase.sh
+          regrade_phase "2/2" "read back" "Asking the API what it actually stored for pipeline=$GITHUB_RUN_ID"
+          # `recordings list` already prints the recording id, entry count, size,
+          # git context and tags. An entry count of 0 means the proxy ran but saw
+          # no traffic.
+          OUT=$(NO_COLOR=1 regrade recordings list --tag pipeline="$GITHUB_RUN_ID" --limit 1 2>&1 || true)
+          echo "$OUT"
+          # shellcheck disable=SC2016  # the backticks are a literal markdown fence
+          printf '### ReGrade recording\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          REC_ID=$(printf '%s\n' "$OUT" | awk '/\(completed\)/{print $2; exit}')
+          ENTRIES=$(printf '%s\n' "$OUT" | awk -F'[: ]+' '/Entries:/{print $3; exit}')
+          regrade_phase_done ok "recording ${REC_ID:-unknown}, ${ENTRIES:-unknown} entries"
+          if [ "${ENTRIES:-0}" -gt 0 ] 2>/dev/null; then
+            regrade_verdict PASS "Baseline recorded for $GITHUB_SHA; pull requests will replay against it" \
+              "the recording summary on this run page"
+          else
+            regrade_verdict WARN "The proxy ran but captured no requests, so this baseline is empty. Check that the test suite was routed through it" \
+              "the recording summary on this run page"
+          fi
+
+  # Replay + analyze on pull requests
+  #
+  # LLM classification (optional, opt-in):
+  #   When enable-llm is true and llm-api-key is set, the analyze step sends API
+  #   response diff summaries to the configured LLM provider for classification.
+  #   Sensitive field values are redacted automatically, but response structure
+  #   and non-sensitive content are visible to the LLM provider.
+  regrade-replay:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Gate off keeps today's behavior: nothing here can fail the workflow.
+    # Gate on lets the analyze step decide, which it does by exit code.
+    continue-on-error: ${{ inputs.fail-on-deltas != true }}
+    container:
+      image: alpine:latest
+    services:
+      app-under-test:
+        image: ${{ inputs.app-image }}
+        # Most real applications live in a private registry. A workflow cannot
+        # omit a key conditionally, so credentials are always present and empty
+        # when the caller passes none, which is how a public image is pulled.
+        credentials:
+          username: ${{ inputs.registry-username }}
+          password: ${{ secrets.registry-password }}
+        ports:
+          - ${{ inputs.app-port }}
+    env:
+      REGRADE_API_URL: ${{ inputs.api-url }}
+      REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
+      REGRADE_PROFILE: ${{ inputs.profile }}
+      REGRADE_ENABLE_LLM: ${{ inputs.enable-llm }}
+      REGRADE_FAIL_ON_DELTAS: ${{ inputs.fail-on-deltas }}
+      LLM_API_KEY: ${{ secrets.llm-api-key }}
+      # GitHub-native context the analyze script reads for PR comment posting
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install ReGrade sensor and analyze script
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache curl ca-certificates python3 py3-pip git
+          curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64" -o /usr/local/bin/regrade
+          curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze" -o /usr/local/bin/regrade-analyze
+          # Published .sha256 files reference versioned filenames; reconstruct
+          # the lines against local paths before sha256sum -c.
+          REGRADE_HASH=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64.sha256" | awk '{print $1}')
+          ANALYZE_HASH=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze.sha256" | awk '{print $1}')
+          printf '%s  /usr/local/bin/regrade\n%s  /usr/local/bin/regrade-analyze\n' "$REGRADE_HASH" "$ANALYZE_HASH" \
+            | sha256sum -c -
+          chmod +x /usr/local/bin/regrade /usr/local/bin/regrade-analyze
+
+          # Phase reporting, written to a file because each step gets its own
+          # shell. Same output as the GitLab template: what is about to happen,
+          # how it went and how long it took, then a verdict naming the rule
+          # that decided the run. The verdict also lands on the run summary
+          # page, where someone who did not open the log will see it.
+          cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
+          regrade_phase() {  # <n/total> <name> <what is about to happen>
+            REGRADE_PHASE_NAME="$2"
+            REGRADE_PHASE_STARTED=$(date +%s)
+            printf '\n=== ReGrade %s: %s ===\n' "$1" "$2"
+            printf '    %s\n' "$3"
+          }
+          regrade_phase_done() {  # <ok|failed> <one line of result>
+            _regrade_elapsed=$(( $(date +%s) - ${REGRADE_PHASE_STARTED:-0} ))
+            if [ "$1" = ok ]; then _regrade_mark='[ok]    '; else _regrade_mark='[FAILED]'; fi
+            printf '%s %s took %dm%02ds: %s\n' "$_regrade_mark" "$REGRADE_PHASE_NAME" \
+              "$(( _regrade_elapsed / 60 ))" "$(( _regrade_elapsed % 60 ))" "$2"
+          }
+          regrade_verdict() {  # <PASS|FAIL|WARN> <why> <where to look>
+            printf '\n=== ReGrade verdict: %s ===\n' "$1"
+            printf '    %s\n' "$2"
+            printf '    Gate: REGRADE_FAIL_ON_DELTAS=%s (true means a delta needing a human decision fails this job)\n' \
+              "${REGRADE_FAIL_ON_DELTAS:-false}"
+            printf '    Report: %s\n' "$3"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### ReGrade verdict: %s\n\n%s\n\nGate: REGRADE_FAIL_ON_DELTAS=%s. Report: %s\n' \
+                "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          PHASE_HELPERS
+          pip install --break-system-packages --quiet \
+            'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
+          if [ "${{ inputs.enable-llm }}" = "true" ]; then
+            pip install --break-system-packages --quiet \
+              'anthropic>=0.40,<1' 'openai>=1.0,<2' 'google-generativeai>=0.8,<1'
+          fi
+
+      - name: Replay recorded baseline against PR head
+        shell: sh
+        run: |
+          set -eu
+          . /tmp/regrade-phase.sh
+          mkdir -p regrade-summary
+          regrade_phase "1/3" "replay" "Re-sending the newest $GITHUB_BASE_REF recording against http://app-under-test:${{ inputs.app-port }} through profile $REGRADE_PROFILE, to compare this commit's responses with the baseline"
+          # --quiet suppresses per-request chatter only. The delta breakdown at
+          # the end is printed, not logged, so it survives. tee keeps a copy:
+          # the breakdown is the one place the labeled/unlabeled split exists.
+          if regrade replay \
+            --tag git_branch="${GITHUB_BASE_REF}" --tag ci=true \
+            --target http://app-under-test:${{ inputs.app-port }} \
+            --profile "$REGRADE_PROFILE" \
+            --replay-tag commit="$GITHUB_SHA" \
+            --replay-tag pipeline="$GITHUB_RUN_ID" \
+            --quiet 2>&1 | tee regrade-summary/replay-output.txt; then
+            # The sensor's own block is the only place the labeled/unlabeled
+            # split exists, so the phase line quotes it back.
+            SUMMARY=$(awk -F': +' '
+              /^  Requests:/ { n = split($2, a, " "); reqs = a[1]; rest = "";
+                               for (i = 2; i <= n; i++) rest = rest (i > 2 ? " " : "") a[i] }
+              /^  Deltas:/   { d = $2 }
+              END { if (reqs != "") printf "%s requests%s, deltas: %s", reqs, (rest == "" ? "" : " " rest), d }
+            ' regrade-summary/replay-output.txt)
+            regrade_phase_done ok "${SUMMARY:-replay finished}"
+          else
+            regrade_phase_done failed "the replay did not finish; nothing to analyze"
+            regrade_verdict FAIL "The replay itself failed, so this commit was never compared with the baseline" \
+              "the replay step log on this run page"
+            exit 1
+          fi
+
+      - name: Classify deltas and post PR comment
+        shell: sh
+        run: |
+          . /tmp/regrade-phase.sh
+          mkdir -p regrade-summary
+          regrade_phase "3/3" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
+          set +e
+          regrade-analyze --output-json regrade-summary/analysis.json
+          code=$?
+          set -e
+          if [ "$REGRADE_FAIL_ON_DELTAS" != "true" ]; then
+            # Gate off: surface the analyze exit code untouched. continue-on-error
+            # keeps it from failing the workflow, and a customer watching for a red
+            # step as their outage signal still sees one.
+            if [ "$code" -eq 0 ]; then
+              regrade_phase_done ok "no delta needs a human decision"
+              regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
+                "the ReGrade comment on this pull request"
+            else
+              regrade_phase_done failed "analyze exited $code"
+              regrade_verdict WARN "Deltas need a human decision, but the gate is off so this does not block the pull request" \
+                "the ReGrade comment on this pull request"
+            fi
+            exit $code
+          fi
+          # Gate on: continue-on-error is boolean only, so the exit-code split is
+          # done here. Only exit 1 (analysis could not run) is swallowed, so a
+          # ReGrade outage cannot block a merge. Enumerating the arms matters: a
+          # bare test for 3 would let the usage-error exit 2 pass as green.
+          case "$code" in
+            0)
+              regrade_phase_done ok "no delta needs a human decision"
+              regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
+                "the ReGrade comment on this pull request"
+              ;;
+            1)
+              echo "::warning::ReGrade analysis could not run (exit 1); not blocking"
+              regrade_phase_done failed "analysis could not run (exit 1)"
+              regrade_verdict WARN "ReGrade could not analyze this run, so the gate is not applied and the pull request is not blocked" \
+                "the analyze step log on this run page"
+              ;;
+            3)
+              echo "::error::ReGrade gate: deltas still need a human decision"
+              regrade_phase_done failed "deltas still need a human decision (exit 3)"
+              regrade_verdict FAIL "Differences from the baseline are unexplained. Explain them with profile rules, or fix the change that caused them" \
+                "the ReGrade comment on this pull request"
+              exit 1
+              ;;
+            *)
+              echo "::error::ReGrade analyze failed (exit $code)"
+              regrade_phase_done failed "analyze exited $code"
+              regrade_verdict FAIL "The analysis step itself failed, so this run was never judged" \
+                "the analyze step log on this run page"
+              exit 1
+              ;;
+          esac
+          exit 0
+
+      - name: Publish replay summary
+        if: always()
+        shell: sh
+        run: |
+          set -eu
+          . /tmp/regrade-phase.sh
+          regrade_phase "2/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA"
+          # The replay step already printed its own delta breakdown, which is the
+          # part no list command can produce. This adds the API's view of the run.
+          OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1 || true)
+          echo "$OUT"
+          # shellcheck disable=SC2016  # the backticks are a literal markdown fence
+          printf '### ReGrade replay\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          regrade_phase_done ok "the API's view of the run is on this run page"

@@ -1,5 +1,16 @@
-# ABOUTME: ReGrade differential testing for the notes app.
-# ABOUTME: Builds the app, records baseline traffic on main, replays on PRs.
+# ABOUTME: ReGrade differential testing for the notes app, via the reusable ReGrade workflow.
+# ABOUTME: Builds the app image, then hands recording and replay to the shared template.
+#
+# This repository is where the shared template gets exercised against a real
+# application on real GitHub runners. The template itself lives in
+# curtail/regrade3 at ci/templates/regrade-github.yml and is vendored here as
+# regrade-template.yml, because a GitHub workflow can only reuse a workflow
+# that lives in a GitHub repository. A job in regrade3 fails if the two drift.
+#
+# What used to be here: a 177-line hand-written copy of the same steps, which
+# had drifted (it still pointed people at `regrade refine-profile`, a command
+# that never existed). Calling the template instead means this repository tests
+# what customers actually run.
 
 name: ReGrade
 
@@ -12,10 +23,6 @@ permissions:
   contents: read
   pull-requests: write
   packages: write
-
-env:
-  REGRADE_API_URL: https://api.regrade.curtail.com/api/v1
-  DOWNLOADS_URL: https://app.regrade.curtail.com/downloads/latest
 
 jobs:
   build-app:
@@ -32,9 +39,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         run: |
-          # ghcr requires lowercase repo path
+          # ghcr requires a lowercase repository path
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image=ghcr.io/${REPO}:${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "image=ghcr.io/${REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -43,135 +50,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  regrade-record:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  regrade:
     needs: build-app
-    runs-on: ubuntu-latest
-    container:
-      image: alpine:latest
-    services:
-      app-under-test:
-        image: ${{ needs.build-app.outputs.image }}
-        credentials:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-        ports:
-          - 8080
-    env:
-      REGRADE_API_KEY: ${{ secrets.REGRADE_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install ReGrade sensor
-        shell: sh
-        run: |
-          set -eu
-          apk add --no-cache curl ca-certificates bash
-          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
-          # The published .sha256 references the versioned filename (e.g.
-          # regrade-3.0.0-linux-x86_64), so reconstruct the line against the
-          # local path before piping into sha256sum -c.
-          EXPECTED=$(curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" | awk '{print $1}')
-          echo "${EXPECTED}  /usr/local/bin/regrade" | sha256sum -c -
-          chmod +x /usr/local/bin/regrade
-      - name: Record baseline traffic
-        shell: bash
-        run: |
-          set -eu
-          regrade proxy \
-            --target http://app-under-test:8080 \
-            --port 8888 \
-            --git-sha "$GITHUB_SHA" \
-            --git-branch main \
-            --tag ci=true \
-            --tag pipeline="$GITHUB_RUN_ID" \
-            --tag git_branch=main &
-          PROXY_PID=$!
-          sleep 2
-
-          # set -e doesn't catch background-process failures, so verify the
-          # proxy is actually alive before sending traffic. Without this,
-          # tests.sh runs through, curl talks direct to the app, the job
-          # exits 0, but ReGrade gets no recording — pure silent failure.
-          if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-            echo "FATAL: regrade proxy failed to start (likely missing REGRADE_API_KEY)" >&2
-            exit 1
-          fi
-
-          # curl deliberately ignores HTTP_PROXY (uppercase) per the httpoxy
-          # CVE mitigation — only http_proxy (lowercase) is honored. Set both
-          # so other clients with stricter rules also pick it up.
-          export http_proxy=http://localhost:8888
-          export https_proxy=http://localhost:8888
-          export REGRADE_TARGET_URL=http://app-under-test:8080
-
-          bash tests.sh
-
-          kill -TERM "$PROXY_PID"
-          wait "$PROXY_PID" || true
-
-  regrade-replay:
-    if: github.event_name == 'pull_request'
-    needs: build-app
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    container:
-      image: alpine:latest
-    services:
-      app-under-test:
-        image: ${{ needs.build-app.outputs.image }}
-        credentials:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-        ports:
-          - 8080
-    env:
-      REGRADE_API_KEY: ${{ secrets.REGRADE_API_KEY }}
-      # Set this to your profile name once you've bootstrapped one with
-      # `regrade refine-profile <replay-id>`. Until then, replay runs
-      # unfiltered and the analyze step is skipped.
-      REGRADE_PROFILE: ${{ vars.REGRADE_PROFILE }}
-      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install ReGrade sensor and analyze script
-        shell: sh
-        run: |
-          set -eu
-          apk add --no-cache curl ca-certificates python3 py3-pip git bash
-          curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64" -o /usr/local/bin/regrade
-          curl -fsSL "${DOWNLOADS_URL}/regrade-analyze" -o /usr/local/bin/regrade-analyze
-          # The published .sha256 files reference versioned filenames; reconstruct
-          # the lines against local paths before piping into sha256sum -c.
-          REGRADE_HASH=$(curl -fsSL "${DOWNLOADS_URL}/regrade-linux-x86_64.sha256" | awk '{print $1}')
-          ANALYZE_HASH=$(curl -fsSL "${DOWNLOADS_URL}/regrade-analyze.sha256" | awk '{print $1}')
-          printf '%s  /usr/local/bin/regrade\n%s  /usr/local/bin/regrade-analyze\n' "$REGRADE_HASH" "$ANALYZE_HASH" \
-            | sha256sum -c -
-          chmod +x /usr/local/bin/regrade /usr/local/bin/regrade-analyze
-          pip install --break-system-packages --quiet \
-            'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
-      - name: Replay baseline against PR head
-        shell: bash
-        run: |
-          set -eu
-          # No --quiet: we want the delta summary visible in the job log so
-          # reviewers can see what ReGrade found without leaving GitHub.
-          regrade replay \
-            --tag git_branch=main --tag ci=true \
-            --target http://app-under-test:8080 \
-            ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
-            --replay-tag commit="$GITHUB_SHA" \
-            --replay-tag pipeline="$GITHUB_RUN_ID"
-      - name: Classify deltas and post PR comment
-        if: env.REGRADE_PROFILE != ''
-        shell: sh
-        run: regrade-analyze
-      - name: Note that analyze was skipped
-        if: env.REGRADE_PROFILE == ''
-        run: |
-          echo "::notice::REGRADE_PROFILE is not set; skipping regrade-analyze."
-          echo "::notice::Replay completed — view deltas at the recording URL above."
-          echo "::notice::To enable PR comments, bootstrap a profile interactively with"
-          echo "::notice::  regrade refine-profile <replay-id>"
-          echo "::notice::then set the REGRADE_PROFILE repository variable."
+    uses: ./.github/workflows/regrade-template.yml
+    with:
+      app-image: ${{ needs.build-app.outputs.image }}
+      app-port: "8080"
+      test-command: "bash tests.sh"
+      # The image is published to this repository's own ghcr namespace, which
+      # is private, so the template needs credentials to pull it as a service.
+      registry-username: ${{ github.actor }}
+      # No profile yet: every difference from the baseline is reported until
+      # one exists. Set it here once a profile has been created.
+      profile: ""
+      fail-on-deltas: false
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+      regrade-api-key: ${{ secrets.REGRADE_API_KEY }}
