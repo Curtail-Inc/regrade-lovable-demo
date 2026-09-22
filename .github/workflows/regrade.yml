@@ -69,7 +69,7 @@ jobs:
       # deltas into 1. x-request-id needs no rule: the sensor already treats it
       # as noise (DEFAULT_NOISY_RESPONSE_HEADERS).
       profile: "notes-demo"
-      fail-on-deltas: false
+      fail-on-deltas: true
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
       regrade-api-key: ${{ secrets.REGRADE_API_KEY }}
