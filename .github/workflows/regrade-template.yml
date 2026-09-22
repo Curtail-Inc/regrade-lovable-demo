@@ -385,7 +385,7 @@ jobs:
         run: |
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
-          regrade_phase "3/3" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
+          regrade_phase "2/3" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
           set +e
           regrade-analyze --output-json regrade-summary/analysis.json
           code=$?
@@ -461,7 +461,7 @@ jobs:
         run: |
           set -eu
           . /tmp/regrade-phase.sh
-          regrade_phase "2/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA"
+          regrade_phase "3/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA"
           # The replay step already printed its own delta breakdown, which is the
           # part no list command can produce. This adds the API's view of the run.
           OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1 || true)
