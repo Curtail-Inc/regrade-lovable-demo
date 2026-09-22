@@ -1,7 +1,10 @@
 # ABOUTME: Reusable GitHub Actions workflow for ReGrade differential testing.
 # ABOUTME: Provides record-on-default-branch and replay-on-PR jobs for customer pipelines.
 #
-# Usage from a caller workflow:
+# Usage: a GitHub workflow can only reuse a workflow that lives in a GitHub
+# repository, and this file is published from GitLab. Copy it into your
+# repository as .github/workflows/regrade-template.yml and call it from a
+# caller workflow by that path:
 #
 #   name: ReGrade
 #   on:
@@ -13,7 +16,7 @@
 #     pull-requests: write   # required for replay job to post the analysis comment
 #   jobs:
 #     regrade:
-#       uses: curtail/regrade3/.github/workflows/regrade.yml@main
+#       uses: ./.github/workflows/regrade-template.yml
 #       with:
 #         app-image: ghcr.io/your-org/your-app:${{ github.sha }}
 #         app-port: '8080'
@@ -203,9 +206,28 @@ jobs:
 
           ${{ inputs.test-command }}
 
-          kill -TERM "$PROXY_PID"
-          wait "$PROXY_PID" || true
-          regrade_phase_done ok "test suite finished and the sensor uploaded what it captured"
+          # wait returns the sensor's own exit status once it has finalized, and
+          # a failed upload exits non-zero, so the phase reports that status
+          # rather than assuming the upload happened. The next step is a new
+          # shell, so the status reaches its verdict through $GITHUB_ENV.
+          #
+          # A kill that fails means the sensor was already gone: it died while
+          # the test suite ran, so later requests were never recorded, and the
+          # step fails.
+          if kill -TERM "$PROXY_PID" 2>/dev/null; then
+            if wait "$PROXY_PID"; then
+              regrade_phase_done ok "test suite finished and the sensor uploaded what it captured"
+            else
+              SENSOR_STATUS=$?
+              echo "REGRADE_SENSOR_STATUS=$SENSOR_STATUS" >> "$GITHUB_ENV"
+              regrade_phase_done failed "the sensor exited $SENSOR_STATUS after the stop signal, so the capture may not have been uploaded; its log is above"
+            fi
+          else
+            if wait "$PROXY_PID"; then SENSOR_STATUS=0; else SENSOR_STATUS=$?; fi
+            echo "REGRADE_SENSOR_EARLY_EXIT=$SENSOR_STATUS" >> "$GITHUB_ENV"
+            regrade_phase_done failed "the sensor exited $SENSOR_STATUS before the test suite finished, so requests after that were not recorded; its log is above"
+            exit 1
+          fi
 
       # actions/upload-artifact cannot run in this job: the runner injects a
       # glibc-linked Node binary to execute JavaScript actions and this
@@ -222,14 +244,40 @@ jobs:
           # `recordings list` already prints the recording id, entry count, size,
           # git context and tags. An entry count of 0 means the proxy ran but saw
           # no traffic.
-          OUT=$(NO_COLOR=1 regrade recordings list --tag pipeline="$GITHUB_RUN_ID" --limit 1 2>&1 || true)
+          # Branched on rather than swallowed, so an API error is reported as a
+          # failed read-back instead of parsing as zero entries. The output is
+          # kept on the run page either way.
+          if OUT=$(NO_COLOR=1 regrade recordings list --tag pipeline="$GITHUB_RUN_ID" --limit 1 2>&1); then
+            READ_BACK=ok
+          else
+            READ_BACK=failed
+          fi
           echo "$OUT"
           # shellcheck disable=SC2016  # the backticks are a literal markdown fence
           printf '### ReGrade recording\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
           REC_ID=$(printf '%s\n' "$OUT" | awk '/\(completed\)/{print $2; exit}')
           ENTRIES=$(printf '%s\n' "$OUT" | awk -F'[: ]+' '/Entries:/{print $3; exit}')
-          regrade_phase_done ok "recording ${REC_ID:-unknown}, ${ENTRIES:-unknown} entries"
-          if [ "${ENTRIES:-0}" -gt 0 ] 2>/dev/null; then
+          if [ "$READ_BACK" = ok ]; then
+            regrade_phase_done ok "recording ${REC_ID:-unknown}, ${ENTRIES:-unknown} entries"
+          else
+            regrade_phase_done failed "the API did not answer, so this job cannot confirm what is stored"
+          fi
+          # A sensor that failed is checked first: a
+          # recording that was never finalized reads back with no entries, the
+          # same as a run that captured nothing, and needs the opposite fix.
+          if [ -n "${REGRADE_SENSOR_EARLY_EXIT:-}" ]; then
+            regrade_verdict FAIL "The sensor exited $REGRADE_SENSOR_EARLY_EXIT before the test suite finished, so this baseline is missing the requests made after that. The sensor's error is in the Record baseline traffic step log" \
+              "the Record baseline traffic step log"
+          elif [ -n "${REGRADE_SENSOR_STATUS:-}" ] && [ "$READ_BACK" = ok ] && [ -n "$REC_ID" ] && [ "${ENTRIES:-0}" -gt 0 ] 2>/dev/null; then
+            regrade_verdict WARN "The sensor reported an error while stopping (exit $REGRADE_SENSOR_STATUS), but the API holds a completed recording with $ENTRIES entries. Check the sensor's error in the Record baseline traffic step log" \
+              "the Record baseline traffic step log"
+          elif [ -n "${REGRADE_SENSOR_STATUS:-}" ]; then
+            regrade_verdict WARN "The sensor exited $REGRADE_SENSOR_STATUS after the stop signal, so the recording was not finalized and this baseline is missing or incomplete. The sensor's error is in the Record baseline traffic step log" \
+              "the Record baseline traffic step log"
+          elif [ "$READ_BACK" = failed ]; then
+            regrade_verdict WARN "Traffic was captured and uploaded, but reading it back failed, so this job cannot confirm what is stored" \
+              "the recording summary on this run page"
+          elif [ "${ENTRIES:-0}" -gt 0 ] 2>/dev/null; then
             regrade_verdict PASS "Baseline recorded for $GITHUB_SHA; pull requests will replay against it" \
               "the recording summary on this run page"
           else
@@ -464,8 +512,20 @@ jobs:
           regrade_phase "3/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA"
           # The replay step already printed its own delta breakdown, which is the
           # part no list command can produce. This adds the API's view of the run.
-          OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1 || true)
+          # Branched on rather than swallowed, so an API error is reported as a
+          # failed read-back instead of [ok]. The output is kept on the run page
+          # either way, and the step still succeeds: the analysis before it
+          # already decided the job.
+          if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1); then
+            READ_BACK=ok
+          else
+            READ_BACK=failed
+          fi
           echo "$OUT"
           # shellcheck disable=SC2016  # the backticks are a literal markdown fence
           printf '### ReGrade replay\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
-          regrade_phase_done ok "the API's view of the run is on this run page"
+          if [ "$READ_BACK" = ok ]; then
+            regrade_phase_done ok "the API's view of the run is on this run page"
+          else
+            regrade_phase_done failed "the API did not answer; its error is on this run page, and the analysis above is unaffected"
+          fi
