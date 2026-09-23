@@ -180,6 +180,7 @@ jobs:
             --git-branch "${GITHUB_REF#refs/heads/}" \
             --tag ci=true \
             --tag pipeline="$GITHUB_RUN_ID" \
+            --tag project="$GITHUB_REPOSITORY" \
             --tag git_branch="${GITHUB_REF#refs/heads/}" &
           PROXY_PID=$!
           sleep 2
@@ -400,9 +401,15 @@ jobs:
           # request for "no profile", it is a request for a profile called ""
           # and the API has no reason to find one. The GitLab template has
           # always omitted it this way.
+          #
+          # The baseline is chosen by tag match alone, newest first. git_branch
+          # and ci are shared by every repository recording into the same
+          # ReGrade team, so project is what keeps this replay on its own
+          # application's recording.
           set +e
           regrade replay \
             --tag git_branch="${GITHUB_BASE_REF}" --tag ci=true \
+            --tag project="$GITHUB_REPOSITORY" \
             --target http://app-under-test:${{ inputs.app-port }} \
             ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
             --replay-tag commit="$GITHUB_SHA" \
@@ -423,12 +430,38 @@ jobs:
             regrade_phase_done ok "${SUMMARY:-replay finished}"
           else
             regrade_phase_done failed "the replay did not finish; nothing to analyze"
+            # No baseline is not a failure of this pull request, and the gate
+            # must not block on it: there is nothing the author can do here,
+            # because the recording is made by the record workflow on the base
+            # branch. It reads the same as a ReGrade outage, which the analyze
+            # step below already refuses to block on, so it is treated the same
+            # way and exits 0.
+            #
+            # A green step is quiet, and that is acceptable only because a
+            # baseline never appears by itself: either the record workflow has
+            # not run yet, or it is failing on the base branch and reporting
+            # that on its own.
+            if grep -q "No completed recording found matching tags" regrade-summary/replay-output.txt; then
+              regrade_verdict WARN "No baseline recording exists yet for $GITHUB_REPOSITORY on ${GITHUB_BASE_REF}, so there was nothing to compare against and this does not block the pull request. Run the record workflow on ${GITHUB_BASE_REF}" \
+                "the replay step log on this run page"
+              # Each step is its own shell, so exiting 0 here lets the analyze
+              # step run next. It has no replay to judge, so the flag reaches
+              # its `if:` through $GITHUB_ENV, the way the sensor status does.
+              echo "REGRADE_NO_BASELINE=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            # Any other replay failure is a real one: the baseline exists and
+            # the comparison still did not happen.
             regrade_verdict FAIL "The replay itself failed, so this commit was never compared with the baseline" \
               "the replay step log on this run page"
             exit 1
           fi
 
       - name: Classify deltas and post PR comment
+        # Skipped when the replay found no baseline: there is no replay to
+        # judge, and running analyze anyway would report its absence as a
+        # failed analysis.
+        if: env.REGRADE_NO_BASELINE != '1'
         shell: sh
         run: |
           . /tmp/regrade-phase.sh
