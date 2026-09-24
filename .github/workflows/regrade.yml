@@ -11,6 +11,11 @@
 # had drifted (it still pointed people at `regrade refine-profile`, a command
 # that never existed). Calling the template instead means this repository tests
 # what customers actually run.
+#
+# The template tags every recording with the repository it came from and filters
+# the replay baseline on that tag, so this app's replay compares against this
+# app's recording even when other repositories record into the same ReGrade
+# team. Before that, the newest recording on any default branch won.
 
 name: ReGrade
 
