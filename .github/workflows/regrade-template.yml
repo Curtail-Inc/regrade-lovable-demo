@@ -603,9 +603,9 @@ jobs:
           exit 0
 
       - name: Publish replay summary
-        # Skipped when the API did not answer: the replay step already said
-        # so, and nothing was stored to read back.
-        if: always() && env.REGRADE_API_UNREACHABLE != '1'
+        # Skipped when the API did not answer or there was no baseline: the
+        # replay step already said so, and nothing was stored to read back.
+        if: always() && env.REGRADE_API_UNREACHABLE != '1' && env.REGRADE_NO_BASELINE != '1'
         shell: sh
         run: |
           set -eu
@@ -616,9 +616,15 @@ jobs:
           # Branched on rather than swallowed, so an API error is reported as a
           # failed read-back instead of [ok]. The output is kept on the run page
           # either way, and the step still succeeds: the analysis before it
-          # already decided the job.
+          # already decided the job. An empty listing is not a confirmation
+          # either: the replay tags its run with this commit, so the API's list
+          # left it out, or the replay failed before storing one.
           if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1); then
-            READ_BACK=ok
+            if printf '%s\n' "$OUT" | grep -q '^0 replay(s) found'; then
+              READ_BACK=empty
+            else
+              READ_BACK=ok
+            fi
           else
             READ_BACK=failed
           fi
@@ -627,6 +633,8 @@ jobs:
           printf '### ReGrade replay\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
           if [ "$READ_BACK" = ok ]; then
             regrade_phase_done ok "the API's view of the run is on this run page"
+          elif [ "$READ_BACK" = empty ]; then
+            regrade_phase_done failed "the API listed no replay tagged commit=$GITHUB_SHA, so this job cannot confirm what is stored; the analysis above is unaffected"
           else
             regrade_phase_done failed "the API did not answer; its error is on this run page, and the analysis above is unaffected"
           fi
