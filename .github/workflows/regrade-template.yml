@@ -183,17 +183,36 @@ jobs:
             --tag project="$GITHUB_REPOSITORY" \
             --tag git_branch="${GITHUB_REF#refs/heads/}" &
           PROXY_PID=$!
-          sleep 2
 
-          # set -e doesn't catch background-process failures. Without this
-          # check, a dead proxy (e.g. missing REGRADE_API_KEY) lets the test
-          # suite run with http_proxy pointing at nothing — curl falls through
-          # to direct, the job exits 0, and ReGrade gets no recording. Silent
-          # failure.
-          if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-            echo "FATAL: regrade proxy failed to start (likely missing REGRADE_API_KEY)" >&2
-            exit 1
-          fi
+          # The sensor exchanges its API key (and checks for a newer version)
+          # before it opens port 8888, so the test command waits until the
+          # port is listening: requests made earlier are refused and never
+          # recorded.
+          # The kernel lists listening sockets in /proc/net/tcp and tcp6 (port
+          # 8888 is 22B8 in hex, state 0A is LISTEN), and reading them sends
+          # nothing through the proxy, so the check adds no request to the
+          # recording. The wait is polled every 0.2s for up to 60s, longer
+          # than the sensor's own 30s limit on the key exchange, so a sensor
+          # that fails that exits with its own error.
+          LISTEN_POLLS=0
+          until awk '$2 ~ /:22B8$/ && $4 == "0A" { found = 1 } END { exit !found }' /proc/net/tcp*; do
+            # set -e doesn't catch background-process failures. Without this
+            # check, a dead proxy (e.g. missing REGRADE_API_KEY) lets the test
+            # suite run with http_proxy pointing at nothing — curl falls
+            # through to direct, the job exits 0, and ReGrade gets no
+            # recording. Silent failure.
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "FATAL: regrade proxy failed to start (likely missing REGRADE_API_KEY)" >&2
+              exit 1
+            fi
+            if [ "$LISTEN_POLLS" -ge 300 ]; then
+              echo "FATAL: regrade proxy was not listening on port 8888 after 60s; its log is above" >&2
+              kill -TERM "$PROXY_PID"
+              exit 1
+            fi
+            LISTEN_POLLS=$((LISTEN_POLLS + 1))
+            sleep 0.2
+          done
 
           # curl deliberately ignores HTTP_PROXY (uppercase) per the httpoxy
           # CVE mitigation — only http_proxy (lowercase) is honored. We set
