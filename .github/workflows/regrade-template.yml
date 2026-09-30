@@ -80,6 +80,16 @@ on:
         required: false
         type: boolean
         default: false
+      source:
+        description: "Name of the traffic source this job records or replays, such as schemathesis or zap. Set it when one repository has more than one record job: the recording is tagged source=<value>, and the replay picks its baseline only from recordings with the same tag. Letters, digits, '.', '_' and '-'. Leave empty for a single source."
+        required: false
+        type: string
+        default: ""
+      team-id:
+        description: "UUID of the ReGrade team that owns the recordings and replays. The API key's owner must be a member of it. Empty leaves the choice to the API, which uses the key owner's default team. Needs a sensor version with --team-id."
+        required: false
+        type: string
+        default: ""
     secrets:
       registry-password:
         description: "Password or token for registry-username. Leave unset for a public image."
@@ -114,6 +124,8 @@ jobs:
     env:
       REGRADE_API_URL: ${{ inputs.api-url }}
       REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
+      REGRADE_INPUT_SOURCE: ${{ inputs.source }}
+      REGRADE_INPUT_TEAM_ID: ${{ inputs.team-id }}
     steps:
       # GitLab clones the repository for a job; GitHub does not. Without this
       # the caller's test command has nothing to run against.
@@ -140,7 +152,9 @@ jobs:
           # shell. Same output as the GitLab template: what is about to happen,
           # how it went and how long it took, then a verdict naming the rule
           # that decided the run. The verdict also lands on the run summary
-          # page, where someone who did not open the log will see it.
+          # page, where someone who did not open the log will see it. The file
+          # also holds the check of the source and team-id inputs, which the
+          # capture and replay steps run before they start the sensor.
           cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
           regrade_phase() {  # <n/total> <name> <what is about to happen>
             REGRADE_PHASE_NAME="$2"
@@ -165,6 +179,28 @@ jobs:
                 "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
+          regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
+            # A team id that is not a UUID would otherwise reach the API only
+            # after the sensor had started. A source holding a comma, a space
+            # or `=` would split into extra tags in the API's tag query, so the
+            # replay would select its baseline on tags nobody set.
+            case "${REGRADE_INPUT_SOURCE:-}" in
+              *[!A-Za-z0-9._-]*)
+                echo "FATAL: the source input may hold only letters, digits, '.', '_' and '-', but it is '$REGRADE_INPUT_SOURCE'" >&2
+                exit 1 ;;
+            esac
+            # One bracket expression per hex digit, four to a variable, so the
+            # pattern matches a UUID exactly: no leading or trailing text, and no
+            # second line.
+            REGRADE_HEX4='[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+            # shellcheck disable=SC2254  # unquoted on purpose: the pattern is the glob
+            case "${REGRADE_INPUT_TEAM_ID:-}" in
+              ''|$REGRADE_HEX4$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4$REGRADE_HEX4$REGRADE_HEX4) ;;
+              *)
+                echo "FATAL: the team-id input must be a team's UUID, such as 123e4567-e89b-12d3-a456-426614174000, but it is '$REGRADE_INPUT_TEAM_ID'" >&2
+                exit 1 ;;
+            esac
+          }
           PHASE_HELPERS
 
       - name: Record baseline traffic
@@ -172,7 +208,8 @@ jobs:
         run: |
           set -eu
           . /tmp/regrade-phase.sh
-          regrade_phase "1/2" "capture" "Recording every request the test suite makes, through the proxy on port 8888 to http://app-under-test:${{ inputs.app-port }}, tagged pipeline=$GITHUB_RUN_ID"
+          regrade_check_inputs
+          regrade_phase "1/2" "capture" "Recording every request the test suite makes, through the proxy on port 8888 to http://app-under-test:${{ inputs.app-port }}, tagged pipeline=$GITHUB_RUN_ID${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
           regrade proxy \
             --target http://app-under-test:${{ inputs.app-port }} \
             --port 8888 \
@@ -181,7 +218,9 @@ jobs:
             --tag ci=true \
             --tag pipeline="$GITHUB_RUN_ID" \
             --tag project="$GITHUB_REPOSITORY" \
-            --tag git_branch="${GITHUB_REF#refs/heads/}" &
+            --tag git_branch="${GITHUB_REF#refs/heads/}" \
+            ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
+            ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} &
           PROXY_PID=$!
 
           # The sensor exchanges its API key (and checks for a newer version)
@@ -279,14 +318,17 @@ jobs:
         run: |
           set -eu
           . /tmp/regrade-phase.sh
-          regrade_phase "2/2" "read back" "Asking the API what it actually stored for pipeline=$GITHUB_RUN_ID"
+          regrade_phase "2/2" "read back" "Asking the API what it actually stored for pipeline=$GITHUB_RUN_ID${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
           # `recordings list` already prints the recording id, entry count, size,
           # git context and tags. An entry count of 0 means the proxy ran but saw
           # no traffic.
           # Branched on rather than swallowed, so an API error is reported as a
           # failed read-back instead of parsing as zero entries. The output is
-          # kept on the run page either way.
-          if OUT=$(NO_COLOR=1 regrade recordings list --tag pipeline="$GITHUB_RUN_ID" --limit 1 2>&1); then
+          # kept on the run page either way. Two record jobs in one run share the
+          # pipeline tag, so the source tag is what keeps this listing on the
+          # recording this job made.
+          if OUT=$(NO_COLOR=1 regrade recordings list --tag pipeline="$GITHUB_RUN_ID" \
+            ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} --limit 1 2>&1); then
             READ_BACK=ok
           else
             READ_BACK=failed
@@ -368,6 +410,8 @@ jobs:
       REGRADE_PROFILE: ${{ inputs.profile }}
       REGRADE_ENABLE_LLM: ${{ inputs.enable-llm }}
       REGRADE_FAIL_ON_DELTAS: ${{ inputs.fail-on-deltas }}
+      REGRADE_INPUT_SOURCE: ${{ inputs.source }}
+      REGRADE_INPUT_TEAM_ID: ${{ inputs.team-id }}
       # The branch whose recording is the baseline. The record job runs only on
       # the default branch, so a pull request into any other branch still
       # replays the default branch's recording, as GitLab merge requests do.
@@ -402,7 +446,9 @@ jobs:
           # shell. Same output as the GitLab template: what is about to happen,
           # how it went and how long it took, then a verdict naming the rule
           # that decided the run. The verdict also lands on the run summary
-          # page, where someone who did not open the log will see it.
+          # page, where someone who did not open the log will see it. The file
+          # also holds the check of the source and team-id inputs, which the
+          # capture and replay steps run before they start the sensor.
           cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
           regrade_phase() {  # <n/total> <name> <what is about to happen>
             REGRADE_PHASE_NAME="$2"
@@ -427,6 +473,28 @@ jobs:
                 "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
+          regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
+            # A team id that is not a UUID would otherwise reach the API only
+            # after the sensor had started. A source holding a comma, a space
+            # or `=` would split into extra tags in the API's tag query, so the
+            # replay would select its baseline on tags nobody set.
+            case "${REGRADE_INPUT_SOURCE:-}" in
+              *[!A-Za-z0-9._-]*)
+                echo "FATAL: the source input may hold only letters, digits, '.', '_' and '-', but it is '$REGRADE_INPUT_SOURCE'" >&2
+                exit 1 ;;
+            esac
+            # One bracket expression per hex digit, four to a variable, so the
+            # pattern matches a UUID exactly: no leading or trailing text, and no
+            # second line.
+            REGRADE_HEX4='[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+            # shellcheck disable=SC2254  # unquoted on purpose: the pattern is the glob
+            case "${REGRADE_INPUT_TEAM_ID:-}" in
+              ''|$REGRADE_HEX4$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4$REGRADE_HEX4$REGRADE_HEX4) ;;
+              *)
+                echo "FATAL: the team-id input must be a team's UUID, such as 123e4567-e89b-12d3-a456-426614174000, but it is '$REGRADE_INPUT_TEAM_ID'" >&2
+                exit 1 ;;
+            esac
+          }
           PHASE_HELPERS
           pip install --break-system-packages --quiet \
             'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
@@ -441,7 +509,8 @@ jobs:
           set -eu
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
-          regrade_phase "1/3" "replay" "Re-sending the newest $REGRADE_BASELINE_BRANCH recording against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          regrade_check_inputs
+          regrade_phase "1/3" "replay" "Re-sending the newest $REGRADE_BASELINE_BRANCH recording${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
           # An outage reaches the replay before it reaches analyze: the
           # sensor's query for the baseline is the first call to the API, and a
           # replay failure blocks when gated. So the API is asked first, and
@@ -490,15 +559,20 @@ jobs:
           # The baseline is chosen by tag match alone, newest first. git_branch
           # and ci are shared by every repository recording into the same
           # ReGrade team, so project is what keeps this replay on its own
-          # application's recording.
+          # application's recording. source does the same for two traffic
+          # sources in one repository, and it tags the replay too, so the
+          # read-back finds this job's replay.
           set +e
           regrade replay \
             --tag git_branch="${REGRADE_BASELINE_BRANCH}" --tag ci=true \
             --tag project="$GITHUB_REPOSITORY" \
+            ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
             --target http://app-under-test:${{ inputs.app-port }} \
             ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
             --replay-tag commit="$GITHUB_SHA" \
             --replay-tag pipeline="$GITHUB_RUN_ID" \
+            ${REGRADE_INPUT_SOURCE:+--replay-tag source="$REGRADE_INPUT_SOURCE"} \
+            ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} \
             --quiet > regrade-summary/replay-output.txt 2>&1
           replay_status=$?
           set -e
@@ -527,7 +601,7 @@ jobs:
             # not run yet, or it is failing on the default branch and reporting
             # that on its own.
             if grep -q "No completed recording found matching tags" regrade-summary/replay-output.txt; then
-              regrade_verdict WARN "No baseline recording exists yet for $GITHUB_REPOSITORY on ${REGRADE_BASELINE_BRANCH}, so there was nothing to compare against and this does not block the pull request. Run the record workflow on ${REGRADE_BASELINE_BRANCH}" \
+              regrade_verdict WARN "No baseline recording exists yet for $GITHUB_REPOSITORY on ${REGRADE_BASELINE_BRANCH}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE}, so there was nothing to compare against and this does not block the pull request. Run the record workflow on ${REGRADE_BASELINE_BRANCH}" \
                 "the replay step log on this run page"
               # Each step is its own shell, so exiting 0 here lets the analyze
               # step run next. It has no replay to judge, so the flag reaches
@@ -553,7 +627,10 @@ jobs:
           mkdir -p regrade-summary
           regrade_phase "2/3" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
           set +e
-          regrade-analyze --output-json regrade-summary/analysis.json
+          # The replay's source picks this job's replay among those tagged with
+          # this commit, and its own pull request comment.
+          regrade-analyze --output-json regrade-summary/analysis.json \
+            ${REGRADE_INPUT_SOURCE:+--source "$REGRADE_INPUT_SOURCE"}
           code=$?
           set -e
           if [ "$REGRADE_FAIL_ON_DELTAS" != "true" ]; then
@@ -629,7 +706,7 @@ jobs:
         run: |
           set -eu
           . /tmp/regrade-phase.sh
-          regrade_phase "3/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA"
+          regrade_phase "3/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
           # The replay step already printed its own delta breakdown, which is the
           # part no list command can produce. This adds the API's view of the run.
           # Branched on rather than swallowed, so an API error is reported as a
@@ -638,7 +715,8 @@ jobs:
           # already decided the job. An empty listing is not a confirmation
           # either: the replay tags its run with this commit, so the API's list
           # left it out, or the replay failed before storing one.
-          if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" --limit 1 2>&1); then
+          if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" \
+            ${REGRADE_INPUT_SOURCE:+--tags source="$REGRADE_INPUT_SOURCE"} --limit 1 2>&1); then
             if printf '%s\n' "$OUT" | grep -q '^0 replay(s) found'; then
               READ_BACK=empty
             else
@@ -653,7 +731,7 @@ jobs:
           if [ "$READ_BACK" = ok ]; then
             regrade_phase_done ok "the API's view of the run is on this run page"
           elif [ "$READ_BACK" = empty ]; then
-            regrade_phase_done failed "the API listed no replay tagged commit=$GITHUB_SHA, so this job cannot confirm what is stored; the analysis above is unaffected"
+            regrade_phase_done failed "the API listed no replay tagged commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}, so this job cannot confirm what is stored; the analysis above is unaffected"
           else
             regrade_phase_done failed "the API did not answer; its error is on this run page, and the analysis above is unaffected"
           fi
