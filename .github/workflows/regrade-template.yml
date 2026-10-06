@@ -100,6 +100,9 @@ on:
       llm-api-key:
         description: "LLM provider API key, required when enable-llm is true"
         required: false
+      test-secret:
+        description: "A credential the test command needs, such as an API scanner's token. The record job exports it to test-command as REGRADE_TEST_SECRET. A called workflow receives only the secrets it declares, so this is how one reaches the test command."
+        required: false
 
 jobs:
   # Record baseline on default-branch pushes
@@ -110,15 +113,19 @@ jobs:
       # The test command runs in this container, so the caller chooses it.
       # Alpine by default, which is enough for a curl-based suite.
       image: ${{ inputs.job-image }}
+      # Root whatever USER the image sets: scanner images such as
+      # schemathesis/schemathesis run as a non-root user, which cannot install
+      # packages or write the sensor to /usr/local/bin.
+      options: --user root
     services:
       app-under-test:
         image: ${{ inputs.app-image }}
         # Most real applications live in a private registry. A workflow cannot
-        # omit a key conditionally, so credentials are always present and empty
-        # when the caller passes none, which is how a public image is pulled.
-        credentials:
-          username: ${{ inputs.registry-username }}
-          password: ${{ secrets.registry-password }}
+        # omit a key conditionally, and GitHub refuses credentials that are
+        # empty strings, so the credentials are built only when the caller
+        # passes registry-username. Without one they are an empty mapping,
+        # which pulls a public image with no login.
+        credentials: ${{ inputs.registry-username != '' && fromJSON(format('{{"username":{0},"password":{1}}}', toJSON(inputs.registry-username), toJSON(secrets.registry-password))) || fromJSON('{}') }}
         ports:
           - ${{ inputs.app-port }}
     env:
@@ -126,6 +133,7 @@ jobs:
       REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
       REGRADE_INPUT_SOURCE: ${{ inputs.source }}
       REGRADE_INPUT_TEAM_ID: ${{ inputs.team-id }}
+      REGRADE_TEST_SECRET: ${{ secrets.test-secret }}
     steps:
       # GitLab clones the repository for a job; GitHub does not. Without this
       # the caller's test command has nothing to run against.
@@ -397,11 +405,11 @@ jobs:
       app-under-test:
         image: ${{ inputs.app-image }}
         # Most real applications live in a private registry. A workflow cannot
-        # omit a key conditionally, so credentials are always present and empty
-        # when the caller passes none, which is how a public image is pulled.
-        credentials:
-          username: ${{ inputs.registry-username }}
-          password: ${{ secrets.registry-password }}
+        # omit a key conditionally, and GitHub refuses credentials that are
+        # empty strings, so the credentials are built only when the caller
+        # passes registry-username. Without one they are an empty mapping,
+        # which pulls a public image with no login.
+        credentials: ${{ inputs.registry-username != '' && fromJSON(format('{{"username":{0},"password":{1}}}', toJSON(inputs.registry-username), toJSON(secrets.registry-password))) || fromJSON('{}') }}
         ports:
           - ${{ inputs.app-port }}
     env:
