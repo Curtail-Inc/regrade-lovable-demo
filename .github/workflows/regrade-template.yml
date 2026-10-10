@@ -132,6 +132,31 @@ env:
           "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
       fi
     }
+    regrade_verdict_pass() {  # <analysis.json> <where to look>; the verdict for analyze exit 0
+      # analyze exits 0 when nothing it read needs a human decision, also when
+      # it could not read the whole delta list; analysis.json says which. A
+      # file that is not a JSON object is a warning, not a traceback and a pass.
+      # The Python starts with "if True:" so it can keep this script's indent.
+      _regrade_analysis=missing
+      if [ -f "$1" ]; then
+        _regrade_analysis=$(python3 -c 'if True:
+          import json, sys
+          try:
+              incomplete = json.load(open(sys.argv[1])).get("incomplete") is True
+          except (OSError, ValueError, AttributeError):
+              print("unreadable")
+          else:
+              print("incomplete" if incomplete else "complete")' "$1") || _regrade_analysis=unreadable
+      fi
+      case "$_regrade_analysis" in
+        incomplete)
+          regrade_verdict WARN "Nothing ReGrade read needs a human decision, but the delta list could not be read completely, so this result may miss deltas. The ReGrade comment and the analyze log say which queries fell short" "$2" ;;
+        unreadable)
+          regrade_verdict WARN "Nothing ReGrade read needs a human decision, but $1 could not be read, so whether the whole delta list was read is unknown. The ReGrade comment and the analyze log say what was read" "$2" ;;
+        *)
+          regrade_verdict PASS "Every difference from the baseline was explained by the profile" "$2" ;;
+      esac
+    }
     regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
       # A team id that is not a UUID would otherwise reach the API only
       # after the sensor had started. A source holding a comma, a space
@@ -611,7 +636,7 @@ jobs:
             case "$code" in
               0)
                 regrade_phase_done ok "no delta needs a human decision"
-                regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
+                regrade_verdict_pass regrade-summary/analysis.json \
                   "the ReGrade comment on this pull request"
                 ;;
               1)
@@ -639,7 +664,7 @@ jobs:
           case "$code" in
             0)
               regrade_phase_done ok "no delta needs a human decision"
-              regrade_verdict PASS "Every difference from the baseline was explained by the profile" \
+              regrade_verdict_pass regrade-summary/analysis.json \
                 "the ReGrade comment on this pull request"
               ;;
             1)
