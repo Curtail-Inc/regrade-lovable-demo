@@ -104,6 +104,57 @@ on:
         description: "A credential the test command needs, such as an API scanner's token. The record job exports it to test-command as REGRADE_TEST_SECRET. A called workflow receives only the secrets it declares, so this is how one reaches the test command."
         required: false
 
+env:
+  # The phase helpers both jobs write to /tmp/regrade-phase.sh for their later
+  # steps to source. Jobs share no files, so each job writes its own copy, and
+  # the text lives here once so the copies cannot drift apart.
+  REGRADE_PHASE_SH: |-
+    regrade_phase() {  # <n/total> <name> <what is about to happen>
+      REGRADE_PHASE_NAME="$2"
+      REGRADE_PHASE_STARTED=$(date +%s)
+      printf '\n=== ReGrade %s: %s ===\n' "$1" "$2"
+      printf '    %s\n' "$3"
+    }
+    regrade_phase_done() {  # <ok|failed> <one line of result>
+      _regrade_elapsed=$(( $(date +%s) - ${REGRADE_PHASE_STARTED:-0} ))
+      if [ "$1" = ok ]; then _regrade_mark='[ok]    '; else _regrade_mark='[FAILED]'; fi
+      printf '%s %s took %dm%02ds: %s\n' "$_regrade_mark" "$REGRADE_PHASE_NAME" \
+        "$(( _regrade_elapsed / 60 ))" "$(( _regrade_elapsed % 60 ))" "$2"
+    }
+    regrade_verdict() {  # <PASS|FAIL|WARN> <why> <where to look>
+      printf '\n=== ReGrade verdict: %s ===\n' "$1"
+      printf '    %s\n' "$2"
+      printf '    Gate: REGRADE_FAIL_ON_DELTAS=%s (true means a delta needing a human decision fails this job)\n' \
+        "${REGRADE_FAIL_ON_DELTAS:-false}"
+      printf '    Report: %s\n' "$3"
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        printf '### ReGrade verdict: %s\n\n%s\n\nGate: REGRADE_FAIL_ON_DELTAS=%s. Report: %s\n' \
+          "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
+      fi
+    }
+    regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
+      # A team id that is not a UUID would otherwise reach the API only
+      # after the sensor had started. A source holding a comma, a space
+      # or `=` would split into extra tags in the API's tag query, so the
+      # replay would select its baseline on tags nobody set.
+      case "${REGRADE_INPUT_SOURCE:-}" in
+        *[!A-Za-z0-9._-]*)
+          echo "FATAL: the source input may hold only letters, digits, '.', '_' and '-', but it is '$REGRADE_INPUT_SOURCE'" >&2
+          exit 1 ;;
+      esac
+      # One bracket expression per hex digit, four to a variable, so the
+      # pattern matches a UUID exactly: no leading or trailing text, and no
+      # second line.
+      REGRADE_HEX4='[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+      # shellcheck disable=SC2254  # unquoted on purpose: the pattern is the glob
+      case "${REGRADE_INPUT_TEAM_ID:-}" in
+        ''|$REGRADE_HEX4$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4$REGRADE_HEX4$REGRADE_HEX4) ;;
+        *)
+          echo "FATAL: the team-id input must be a team's UUID, such as 123e4567-e89b-12d3-a456-426614174000, but it is '$REGRADE_INPUT_TEAM_ID'" >&2
+          exit 1 ;;
+      esac
+    }
+
 jobs:
   # Record baseline on default-branch pushes
   regrade-record:
@@ -163,53 +214,7 @@ jobs:
           # page, where someone who did not open the log will see it. The file
           # also holds the check of the source and team-id inputs, which the
           # capture and replay steps run before they start the sensor.
-          cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
-          regrade_phase() {  # <n/total> <name> <what is about to happen>
-            REGRADE_PHASE_NAME="$2"
-            REGRADE_PHASE_STARTED=$(date +%s)
-            printf '\n=== ReGrade %s: %s ===\n' "$1" "$2"
-            printf '    %s\n' "$3"
-          }
-          regrade_phase_done() {  # <ok|failed> <one line of result>
-            _regrade_elapsed=$(( $(date +%s) - ${REGRADE_PHASE_STARTED:-0} ))
-            if [ "$1" = ok ]; then _regrade_mark='[ok]    '; else _regrade_mark='[FAILED]'; fi
-            printf '%s %s took %dm%02ds: %s\n' "$_regrade_mark" "$REGRADE_PHASE_NAME" \
-              "$(( _regrade_elapsed / 60 ))" "$(( _regrade_elapsed % 60 ))" "$2"
-          }
-          regrade_verdict() {  # <PASS|FAIL|WARN> <why> <where to look>
-            printf '\n=== ReGrade verdict: %s ===\n' "$1"
-            printf '    %s\n' "$2"
-            printf '    Gate: REGRADE_FAIL_ON_DELTAS=%s (true means a delta needing a human decision fails this job)\n' \
-              "${REGRADE_FAIL_ON_DELTAS:-false}"
-            printf '    Report: %s\n' "$3"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '### ReGrade verdict: %s\n\n%s\n\nGate: REGRADE_FAIL_ON_DELTAS=%s. Report: %s\n' \
-                "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
-          regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
-            # A team id that is not a UUID would otherwise reach the API only
-            # after the sensor had started. A source holding a comma, a space
-            # or `=` would split into extra tags in the API's tag query, so the
-            # replay would select its baseline on tags nobody set.
-            case "${REGRADE_INPUT_SOURCE:-}" in
-              *[!A-Za-z0-9._-]*)
-                echo "FATAL: the source input may hold only letters, digits, '.', '_' and '-', but it is '$REGRADE_INPUT_SOURCE'" >&2
-                exit 1 ;;
-            esac
-            # One bracket expression per hex digit, four to a variable, so the
-            # pattern matches a UUID exactly: no leading or trailing text, and no
-            # second line.
-            REGRADE_HEX4='[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
-            # shellcheck disable=SC2254  # unquoted on purpose: the pattern is the glob
-            case "${REGRADE_INPUT_TEAM_ID:-}" in
-              ''|$REGRADE_HEX4$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4$REGRADE_HEX4$REGRADE_HEX4) ;;
-              *)
-                echo "FATAL: the team-id input must be a team's UUID, such as 123e4567-e89b-12d3-a456-426614174000, but it is '$REGRADE_INPUT_TEAM_ID'" >&2
-                exit 1 ;;
-            esac
-          }
-          PHASE_HELPERS
+          printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
 
       - name: Record baseline traffic
         shell: sh
@@ -457,53 +462,7 @@ jobs:
           # page, where someone who did not open the log will see it. The file
           # also holds the check of the source and team-id inputs, which the
           # capture and replay steps run before they start the sensor.
-          cat > /tmp/regrade-phase.sh <<'PHASE_HELPERS'
-          regrade_phase() {  # <n/total> <name> <what is about to happen>
-            REGRADE_PHASE_NAME="$2"
-            REGRADE_PHASE_STARTED=$(date +%s)
-            printf '\n=== ReGrade %s: %s ===\n' "$1" "$2"
-            printf '    %s\n' "$3"
-          }
-          regrade_phase_done() {  # <ok|failed> <one line of result>
-            _regrade_elapsed=$(( $(date +%s) - ${REGRADE_PHASE_STARTED:-0} ))
-            if [ "$1" = ok ]; then _regrade_mark='[ok]    '; else _regrade_mark='[FAILED]'; fi
-            printf '%s %s took %dm%02ds: %s\n' "$_regrade_mark" "$REGRADE_PHASE_NAME" \
-              "$(( _regrade_elapsed / 60 ))" "$(( _regrade_elapsed % 60 ))" "$2"
-          }
-          regrade_verdict() {  # <PASS|FAIL|WARN> <why> <where to look>
-            printf '\n=== ReGrade verdict: %s ===\n' "$1"
-            printf '    %s\n' "$2"
-            printf '    Gate: REGRADE_FAIL_ON_DELTAS=%s (true means a delta needing a human decision fails this job)\n' \
-              "${REGRADE_FAIL_ON_DELTAS:-false}"
-            printf '    Report: %s\n' "$3"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '### ReGrade verdict: %s\n\n%s\n\nGate: REGRADE_FAIL_ON_DELTAS=%s. Report: %s\n' \
-                "$1" "$2" "${REGRADE_FAIL_ON_DELTAS:-false}" "$3" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
-          regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
-            # A team id that is not a UUID would otherwise reach the API only
-            # after the sensor had started. A source holding a comma, a space
-            # or `=` would split into extra tags in the API's tag query, so the
-            # replay would select its baseline on tags nobody set.
-            case "${REGRADE_INPUT_SOURCE:-}" in
-              *[!A-Za-z0-9._-]*)
-                echo "FATAL: the source input may hold only letters, digits, '.', '_' and '-', but it is '$REGRADE_INPUT_SOURCE'" >&2
-                exit 1 ;;
-            esac
-            # One bracket expression per hex digit, four to a variable, so the
-            # pattern matches a UUID exactly: no leading or trailing text, and no
-            # second line.
-            REGRADE_HEX4='[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
-            # shellcheck disable=SC2254  # unquoted on purpose: the pattern is the glob
-            case "${REGRADE_INPUT_TEAM_ID:-}" in
-              ''|$REGRADE_HEX4$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4-$REGRADE_HEX4$REGRADE_HEX4$REGRADE_HEX4) ;;
-              *)
-                echo "FATAL: the team-id input must be a team's UUID, such as 123e4567-e89b-12d3-a456-426614174000, but it is '$REGRADE_INPUT_TEAM_ID'" >&2
-                exit 1 ;;
-            esac
-          }
-          PHASE_HELPERS
+          printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
           pip install --break-system-packages --quiet \
             'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
           if [ "${{ inputs.enable-llm }}" = "true" ]; then
