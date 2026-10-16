@@ -77,7 +77,10 @@ async function handle(req: Request): Promise<Response> {
   const path = url.pathname;
 
   if (path === "/api/health" && req.method === "GET") {
-    return json(200, { status: "ok" });
+    // Deliberate change: the replay job should report this as a difference
+    // from the baseline. It is how this repository proves the shared ReGrade
+    // workflow still detects a changed response.
+    return json(200, { status: "ok", version: "2" });
   }
 
   if (path === "/api/login" && req.method === "POST") {
