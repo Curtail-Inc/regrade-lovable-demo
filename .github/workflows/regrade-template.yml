@@ -462,6 +462,18 @@ jobs:
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
+      # actions/checkout clones only when git is on the PATH, and this
+      # container has none until a step adds it. Without git it downloads a
+      # tarball with no .git, so the replay cannot find the branch point and
+      # analyze has no history. The runner owns the workspace and this
+      # container runs as root, so git refuses it as dubious ownership unless
+      # it is marked safe; actions/checkout does that only inside its own
+      # temporary config, which later steps do not see.
+      - name: Install git for the checkout
+        shell: sh
+        run: |
+          apk add --no-cache git
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       # analyze compares deltas against the code that changed, so it needs the
       # repository and its history, not just the working tree.
       - uses: actions/checkout@v4
