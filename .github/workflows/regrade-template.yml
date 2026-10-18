@@ -458,6 +458,8 @@ jobs:
       # GitHub-native context the analyze script reads for PR comment posting
       GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # The replay finds the branch point from these two (see the replay step).
+      GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       # analyze compares deltas against the code that changed, so it needs the
@@ -502,7 +504,7 @@ jobs:
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
           regrade_check_inputs
-          regrade_phase "1/3" "replay" "Re-sending the newest $REGRADE_BASELINE_BRANCH recording${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          regrade_phase "1/3" "replay" "Re-sending the $REGRADE_BASELINE_BRANCH recording${GITHUB_BASE_SHA:+ made at the branch point of this pull request (or the newest)}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
           # An outage reaches the replay before it reaches analyze: the
           # sensor's query for the baseline is the first call to the API, and a
           # replay failure blocks when gated. So the API is asked first, and
@@ -548,27 +550,76 @@ jobs:
           # and the API has no reason to find one. The GitLab template has
           # always omitted it this way.
           #
-          # The baseline is chosen by tag match alone, newest first. git_branch
-          # and ci are shared by every repository recording into the same
-          # ReGrade team, so project is what keeps this replay on its own
+          # The baseline is chosen by tag match, newest first. git_branch and
+          # ci are shared by every repository recording into the same ReGrade
+          # team, so project is what keeps this replay on its own
           # application's recording. source does the same for two traffic
           # sources in one repository, and it tags the replay too, so the
           # read-back finds this job's replay.
-          set +e
-          regrade replay \
-            --tag git_branch="${REGRADE_BASELINE_BRANCH}" --tag ci=true \
-            --tag project="$GITHUB_REPOSITORY" \
-            ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
-            --target http://app-under-test:${{ inputs.app-port }} \
-            ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
-            --replay-tag commit="$GITHUB_SHA" \
-            --replay-tag pipeline="$GITHUB_RUN_ID" \
-            ${REGRADE_INPUT_SOURCE:+--replay-tag source="$REGRADE_INPUT_SOURCE"} \
-            ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} \
-            --quiet > regrade-summary/replay-output.txt 2>&1
-          replay_status=$?
-          set -e
-          cat regrade-summary/replay-output.txt
+          regrade_replay() {
+            regrade_replay_status=0
+            regrade replay \
+              --tag git_branch="${REGRADE_BASELINE_BRANCH}" --tag ci=true \
+              --tag project="$GITHUB_REPOSITORY" \
+              ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
+              "$@" \
+              --target http://app-under-test:${{ inputs.app-port }} \
+              ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
+              --replay-tag commit="$GITHUB_SHA" \
+              --replay-tag pipeline="$GITHUB_RUN_ID" \
+              ${REGRADE_INPUT_SOURCE:+--replay-tag source="$REGRADE_INPUT_SOURCE"} \
+              ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} \
+              --quiet > regrade-summary/replay-output.txt 2>&1 || regrade_replay_status=$?
+            cat regrade-summary/replay-output.txt
+            return "$regrade_replay_status"
+          }
+          regrade_no_recording() {
+            grep -q "No completed recording found matching tags" regrade-summary/replay-output.txt
+          }
+          # A pull request replays the recording of the commit it branched
+          # from (the sensor tags each recording with git_sha): the newest
+          # recording can hold changes this branch does not have, and every
+          # delta those changes cause would be reported against it.
+          # pull_request.base.sha is the base branch's tip when the event
+          # fired, so the branch point is the merge base of it and the head,
+          # read from the full history the checkout above fetches. A default
+          # branch run can end without a recording, so when that commit has
+          # none, the nearest of the 10 before it that has one is used,
+          # following first parents because a merged branch's commits were
+          # never recorded there. Only when none of those has one is the
+          # newest used, and the log says so.
+          replay_status=0
+          BRANCH_POINT=""
+          if [ -n "${GITHUB_BASE_SHA:-}" ]; then
+            BRANCH_POINT=$(git merge-base "$GITHUB_BASE_SHA" "${GITHUB_HEAD_SHA:-HEAD}") || \
+              echo "WARNING: could not find where this pull request branched from $GITHUB_BASE_SHA in the checkout; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead"
+          fi
+          if [ -n "$BRANCH_POINT" ]; then
+            if regrade_replay --tag git_sha="$BRANCH_POINT"; then
+              :
+            elif regrade_no_recording; then
+              BASELINE_SHA=""
+              for SHA in $(git rev-list --first-parent --skip=1 --max-count=10 "$BRANCH_POINT"); do
+                if regrade_replay --tag git_sha="$SHA"; then
+                  BASELINE_SHA=$SHA
+                  break
+                elif ! regrade_no_recording; then
+                  replay_status=1
+                  break
+                fi
+              done
+              if [ -n "$BASELINE_SHA" ]; then
+                echo "The branch point $BRANCH_POINT has no recording; compared with the recording of $BASELINE_SHA, the nearest earlier $REGRADE_BASELINE_BRANCH commit that has one"
+              elif [ "$replay_status" -eq 0 ]; then
+                echo "WARNING: no recording of the branch point $BRANCH_POINT or up to 10 $REGRADE_BASELINE_BRANCH commits before it; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead, which may include changes this branch does not have"
+                regrade_replay || replay_status=$?
+              fi
+            else
+              replay_status=1
+            fi
+          else
+            regrade_replay || replay_status=$?
+          fi
           if [ "$replay_status" -eq 0 ]; then
             # The sensor's own block is the only place the labeled/unlabeled
             # split exists, so the phase line quotes it back.
