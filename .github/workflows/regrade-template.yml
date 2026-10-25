@@ -1,5 +1,5 @@
 # ABOUTME: Reusable GitHub Actions workflow for ReGrade differential testing.
-# ABOUTME: Provides record-on-default-branch and replay-on-PR jobs for customer pipelines.
+# ABOUTME: Provides record-on-default-branch plus replay and analysis jobs on PRs for customer pipelines.
 #
 # Usage: a GitHub workflow can only reuse a workflow that lives in a GitHub
 # repository, and this file is published from GitLab. Copy it into your
@@ -13,7 +13,7 @@
 #     pull_request:
 #   permissions:
 #     contents: read
-#     pull-requests: write   # required for replay job to post the analysis comment
+#     pull-requests: write   # required for the analysis job to post its comment
 #   jobs:
 #     regrade:
 #       uses: ./.github/workflows/regrade-template.yml
@@ -25,8 +25,13 @@
 #       secrets:
 #         regrade-api-key: ${{ secrets.REGRADE_API_KEY }}
 #
-# The CLI and analyze script are downloaded at job start from
-# app.regrade.curtail.com — no custom container image is required.
+# The workflow runs a record job on the default branch, and on pull requests a
+# replay job and an analysis job. The replay job downloads the CLI and the
+# analysis job downloads the analyze script, both at job start from
+# app.regrade.curtail.com, so no custom container image is required.
+#
+# If you require the ReGrade status check in branch protection, require the
+# regrade-analyze job too.
 
 name: ReGrade Differential Testing
 
@@ -105,7 +110,7 @@ on:
         required: false
 
 env:
-  # The phase helpers both jobs write to /tmp/regrade-phase.sh for their later
+  # The phase helpers every job writes to /tmp/regrade-phase.sh for their later
   # steps to source. Jobs share no files, so each job writes its own copy, and
   # the text lives here once so the copies cannot drift apart.
   REGRADE_PHASE_SH: |-
@@ -416,21 +421,24 @@ jobs:
               "the recording summary on this run page"
           fi
 
-  # Replay + analyze on pull requests
+  # Replay on pull requests
   #
-  # LLM classification (optional, opt-in):
-  #   When enable-llm is true and llm-api-key is set, the analyze step sends API
-  #   response diff summaries to the configured LLM provider for classification.
-  #   Sensitive field values are redacted automatically, but response structure
-  #   and non-sensitive content are visible to the LLM provider.
+  # The replay job re-sends the baseline recording against the pull request's
+  # build and reports how that went. The regrade-analyze job judges the deltas
+  # and runs only for a replay that completed. This job's outcome output is how
+  # the two are joined.
   regrade-replay:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # Gate off keeps today's behavior: nothing here can fail the workflow.
-    # Gate on lets the analyze step decide, which it does by exit code.
+    # Gate on lets the replay fail it for a replay that did not finish,
+    # except where the sensor's exit status says the cause is not this pull
+    # request's (no baseline, or an API that did not answer).
     continue-on-error: ${{ inputs.fail-on-deltas != true }}
     container:
       image: alpine:latest
+    outputs:
+      outcome: ${{ steps.replay.outputs.outcome }}
     services:
       app-under-test:
         image: ${{ inputs.app-image }}
@@ -446,7 +454,6 @@ jobs:
       REGRADE_API_URL: ${{ inputs.api-url }}
       REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
       REGRADE_PROFILE: ${{ inputs.profile }}
-      REGRADE_ENABLE_LLM: ${{ inputs.enable-llm }}
       REGRADE_FAIL_ON_DELTAS: ${{ inputs.fail-on-deltas }}
       REGRADE_INPUT_SOURCE: ${{ inputs.source }}
       REGRADE_INPUT_TEAM_ID: ${{ inputs.team-id }}
@@ -454,45 +461,38 @@ jobs:
       # the default branch, so a pull request into any other branch still
       # replays the default branch's recording, as GitLab merge requests do.
       REGRADE_BASELINE_BRANCH: ${{ github.event.repository.default_branch }}
-      LLM_API_KEY: ${{ secrets.llm-api-key }}
-      # GitHub-native context the analyze script reads for PR comment posting
-      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       # The replay finds the branch point from these two (see the replay step).
+      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      GITHUB_TOKEN: ${{ github.token }}
     steps:
       # actions/checkout clones only when git is on the PATH, and this
       # container has none until a step adds it. Without git it downloads a
-      # tarball with no .git, so the replay cannot find the branch point and
-      # analyze has no history. The runner owns the workspace and this
-      # container runs as root, so git refuses it as dubious ownership unless
-      # it is marked safe; actions/checkout does that only inside its own
-      # temporary config, which later steps do not see.
+      # tarball with no .git, so the replay cannot find the branch point. The
+      # runner owns the workspace and this container runs as root, so git
+      # refuses it as dubious ownership unless it is marked safe;
+      # actions/checkout does that only inside its own temporary config, which
+      # later steps do not see.
       - name: Install git for the checkout
         shell: sh
         run: |
           apk add --no-cache git
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      # analyze compares deltas against the code that changed, so it needs the
-      # repository and its history, not just the working tree.
+      # The replay reads the history only to find the commit the pull request
+      # branched from.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install ReGrade sensor and analyze script
+      - name: Install ReGrade sensor
         shell: sh
         run: |
           set -eu
-          apk add --no-cache curl ca-certificates python3 py3-pip git
+          apk add --no-cache curl ca-certificates
           curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64" -o /usr/local/bin/regrade
-          curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze" -o /usr/local/bin/regrade-analyze
           # Published .sha256 files reference versioned filenames; reconstruct
-          # the lines against local paths before sha256sum -c.
+          # the line against the local path before sha256sum -c.
           REGRADE_HASH=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64.sha256" | awk '{print $1}')
-          ANALYZE_HASH=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze.sha256" | awk '{print $1}')
-          printf '%s  /usr/local/bin/regrade\n%s  /usr/local/bin/regrade-analyze\n' "$REGRADE_HASH" "$ANALYZE_HASH" \
-            | sha256sum -c -
-          chmod +x /usr/local/bin/regrade /usr/local/bin/regrade-analyze
+          printf '%s  /usr/local/bin/regrade\n' "$REGRADE_HASH" | sha256sum -c -
+          chmod +x /usr/local/bin/regrade
 
           # Phase reporting, written to a file because each step gets its own
           # shell. Same output as the GitLab template: what is about to happen,
@@ -502,55 +502,34 @@ jobs:
           # also holds the check of the source and team-id inputs, which the
           # capture and replay steps run before they start the sensor.
           printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
-          pip install --break-system-packages --quiet \
-            'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
-          if [ "${{ inputs.enable-llm }}" = "true" ]; then
-            pip install --break-system-packages --quiet \
-              'anthropic>=0.40,<1' 'openai>=1.0,<2' 'google-genai>=2,<3'
-          fi
 
       - name: Replay recorded baseline against PR head
+        id: replay
         shell: sh
         run: |
           set -eu
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
           regrade_check_inputs
-          regrade_phase "1/3" "replay" "Re-sending the $REGRADE_BASELINE_BRANCH recording${GITHUB_BASE_SHA:+ made at the branch point of this pull request (or the newest)}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
-          # An outage reaches the replay before it reaches analyze: the
-          # sensor's query for the baseline is the first call to the API, and a
-          # replay failure blocks when gated. So the API is asked first, and
-          # one that does not answer ends the run with a warning. A path under
-          # the API URL is asked, not the host's /health, because a proxy in
-          # front of the API can answer /health itself while the API behind it
-          # is down. Any answer below 500, a 404 included, is the API
-          # replying. Only a refused connection (curl exit 7), a timeout (28)
-          # or a 5xx is an outage. Any other curl failure, such as an unknown
-          # host or an untrusted certificate, is a setting to fix, so it falls
-          # through to the replay, which fails and blocks when gated like
-          # every replay failure after this. The analyze step has nothing to
-          # judge, so the flag reaches its `if:` through $GITHUB_ENV.
-          #
-          # Gate on, the outage does not block. Gate off, the step exits 1,
-          # which continue-on-error keeps from failing the workflow: the same
-          # outage signal the analyze step gives when it cannot run.
-          REGRADE_API_CURL=0
-          REGRADE_API_HTTP=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
-            "$REGRADE_API_URL/health") || REGRADE_API_CURL=$?
-          if [ "$REGRADE_API_CURL" -eq 7 ] || [ "$REGRADE_API_CURL" -eq 28 ] || \
-              { [ "$REGRADE_API_CURL" -eq 0 ] && [ "$REGRADE_API_HTTP" -ge 500 ]; }; then
-            regrade_phase_done failed "the ReGrade API at $REGRADE_API_URL did not answer (curl exit $REGRADE_API_CURL, HTTP $REGRADE_API_HTTP); nothing was replayed"
-            regrade_verdict WARN "ReGrade unreachable, not gating this run. $REGRADE_API_URL did not answer, so this commit was not compared with the baseline and the pull request is not blocked" \
-              "the replay step log on this run page"
-            echo "REGRADE_API_UNREACHABLE=1" >> "$GITHUB_ENV"
-            if [ "$REGRADE_FAIL_ON_DELTAS" = "true" ]; then
-              exit 0
-            fi
-            exit 1
-          fi
-          # Written to a file and echoed, rather than piped into tee: this
-          # shell has no pipefail, so a pipeline reports tee's status and a
-          # replay that died on a server error would read as success.
+          regrade_phase "1/2" "replay" "Re-sending the $REGRADE_BASELINE_BRANCH recording${GITHUB_BASE_SHA:+ made at the branch point of this pull request (or the newest)}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          # The outcome of this replay, for the analysis job. It is written
+          # exactly once, by the branch below that the replay's exit status
+          # takes, because a step output written twice depends on which write
+          # the runner keeps. A step that ended before that branch (a failed
+          # input check, say) writes nothing, the output is empty, and the
+          # analysis job, which runs only for "completed", is skipped.
+          regrade_replay_outcome() {
+            printf 'outcome=%s\n' "$1" >> "$GITHUB_OUTPUT"
+          }
+          # The sensor's exit status says why a replay ended, so this script
+          # reads that and never the sensor's text. `regrade --help` lists the
+          # statuses; the two this script tells apart from a failed replay are:
+          #   66  no recording matches the tags the replay filters on
+          #   75  the ReGrade API did not answer, or stopped answering
+          # Any other non-zero status is a failed replay. The sensor's output
+          # goes to a file and is printed afterwards, not piped through tee:
+          # this shell has no pipefail, so a pipeline reports tee's status and
+          # a 66 or 75 would read as 0, passing a replay that never happened.
           #
           # --quiet suppresses per-request chatter only. The delta breakdown at
           # the end is printed, not logged, so it survives. The file keeps a
@@ -585,102 +564,206 @@ jobs:
             cat regrade-summary/replay-output.txt
             return "$regrade_replay_status"
           }
-          regrade_no_recording() {
-            grep -q "No completed recording found matching tags" regrade-summary/replay-output.txt
-          }
           # A pull request replays the recording of the commit it branched
           # from (the sensor tags each recording with git_sha): the newest
           # recording can hold changes this branch does not have, and every
           # delta those changes cause would be reported against it.
           # pull_request.base.sha is the base branch's tip when the event
           # fired, so the branch point is the merge base of it and the head,
-          # read from the full history the checkout above fetches. A default
-          # branch run can end without a recording, so when that commit has
-          # none, the nearest of the 10 before it that has one is used,
-          # following first parents because a merged branch's commits were
-          # never recorded there. Only when none of those has one is the
-          # newest used, and the log says so.
-          replay_status=0
+          # read from the full history the checkout above fetches. When that
+          # commit has no recording (status 66), the newest is used and the
+          # log says so. The status of the last replay run is the one that
+          # decides the job.
+          REPLAY_STATUS=0
           BRANCH_POINT=""
           if [ -n "${GITHUB_BASE_SHA:-}" ]; then
             BRANCH_POINT=$(git merge-base "$GITHUB_BASE_SHA" "${GITHUB_HEAD_SHA:-HEAD}") || \
               echo "WARNING: could not find where this pull request branched from $GITHUB_BASE_SHA in the checkout; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead"
           fi
           if [ -n "$BRANCH_POINT" ]; then
-            if regrade_replay --tag git_sha="$BRANCH_POINT"; then
-              :
-            elif regrade_no_recording; then
-              BASELINE_SHA=""
-              for SHA in $(git rev-list --first-parent --skip=1 --max-count=10 "$BRANCH_POINT"); do
-                if regrade_replay --tag git_sha="$SHA"; then
-                  BASELINE_SHA=$SHA
-                  break
-                elif ! regrade_no_recording; then
-                  replay_status=1
-                  break
-                fi
-              done
-              if [ -n "$BASELINE_SHA" ]; then
-                echo "The branch point $BRANCH_POINT has no recording; compared with the recording of $BASELINE_SHA, the nearest earlier $REGRADE_BASELINE_BRANCH commit that has one"
-              elif [ "$replay_status" -eq 0 ]; then
-                echo "WARNING: no recording of the branch point $BRANCH_POINT or up to 10 $REGRADE_BASELINE_BRANCH commits before it; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead, which may include changes this branch does not have"
-                regrade_replay || replay_status=$?
-              fi
-            else
-              replay_status=1
-            fi
+            regrade_replay --tag git_sha="$BRANCH_POINT" || REPLAY_STATUS=$?
+            case "$REPLAY_STATUS" in
+              66)
+                echo "WARNING: no recording of the branch point $BRANCH_POINT; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead, which may include changes this branch does not have"
+                REPLAY_STATUS=0
+                regrade_replay || REPLAY_STATUS=$?
+                ;;
+            esac
           else
-            regrade_replay || replay_status=$?
+            regrade_replay || REPLAY_STATUS=$?
           fi
-          if [ "$replay_status" -eq 0 ]; then
-            # The sensor's own block is the only place the labeled/unlabeled
-            # split exists, so the phase line quotes it back.
-            SUMMARY=$(awk -F': +' '
-              /^  Requests:/ { n = split($2, a, " "); reqs = a[1]; rest = "";
-                               for (i = 2; i <= n; i++) rest = rest (i > 2 ? " " : "") a[i] }
-              /^  Deltas:/   { d = $2 }
-              END { if (reqs != "") printf "%s requests%s, deltas: %s", reqs, (rest == "" ? "" : " " rest), d }
-            ' regrade-summary/replay-output.txt)
-            regrade_phase_done ok "${SUMMARY:-replay finished}"
-          else
-            regrade_phase_done failed "the replay did not finish; nothing to analyze"
-            # No baseline is not a failure of this pull request, and the gate
-            # must not block on it: there is nothing the author can do here,
-            # because the recording is made by the record workflow on the default
-            # branch. It reads the same as a ReGrade outage, which the check
-            # above and the analyze step below already refuse to block on, so
-            # it is treated the same way and exits 0.
-            #
-            # A green step is quiet, and that is acceptable only because a
-            # baseline never appears by itself: either the record workflow has
-            # not run yet, or it is failing on the default branch and reporting
-            # that on its own.
-            if grep -q "No completed recording found matching tags" regrade-summary/replay-output.txt; then
+          case "$REPLAY_STATUS" in
+            0)
+              # The sensor's own block is the only place the labeled/unlabeled
+              # split exists, so the phase line quotes it back rather than
+              # recomputing it.
+              SUMMARY=$(awk -F': +' '
+                /^  Requests:/ { n = split($2, a, " "); reqs = a[1]; rest = "";
+                                 for (i = 2; i <= n; i++) rest = rest (i > 2 ? " " : "") a[i] }
+                /^  Deltas:/   { d = $2 }
+                END { if (reqs != "") printf "%s requests%s, deltas: %s", reqs, (rest == "" ? "" : " " rest), d }
+              ' regrade-summary/replay-output.txt)
+              regrade_replay_outcome completed
+              regrade_phase_done ok "${SUMMARY:-replay finished}"
+              ;;
+            66)
+              regrade_replay_outcome no-baseline
+              regrade_phase_done failed "the replay did not finish; nothing to analyze"
+              # No baseline is not a failure of this pull request, and the gate
+              # must not block on it: there is nothing the author can do here,
+              # because the recording is made by the record workflow on the
+              # default branch. It reads the same as a ReGrade outage, which
+              # the 75 arm refuses to block on, so it is treated the same way
+              # and exits 0.
+              #
+              # A green step is quiet, and that is acceptable only because a
+              # baseline never appears by itself: either the record workflow
+              # has not run yet, or it is failing on the default branch and
+              # reporting that on its own.
               regrade_verdict WARN "No baseline recording exists yet for $GITHUB_REPOSITORY on ${REGRADE_BASELINE_BRANCH}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE}, so there was nothing to compare against and this does not block the pull request. Run the record workflow on ${REGRADE_BASELINE_BRANCH}" \
                 "the replay step log on this run page"
-              # Each step is its own shell, so exiting 0 here lets the analyze
-              # step run next. It has no replay to judge, so the flag reaches
-              # its `if:` through $GITHUB_ENV, the way the sensor status does.
-              echo "REGRADE_NO_BASELINE=1" >> "$GITHUB_ENV"
               exit 0
+              ;;
+            75)
+              regrade_replay_outcome api-unavailable
+              regrade_phase_done failed "the ReGrade API at $REGRADE_API_URL did not answer or stopped answering, so the replay did not finish; nothing to analyze"
+              # The outage can come before the first request or part way
+              # through a replay, so the run is never read back or analyzed.
+              # Gate on, it does not block. Gate off, the step exits 1, which
+              # continue-on-error keeps from failing the workflow: the same
+              # outage signal the analysis job gives when it cannot run.
+              regrade_verdict WARN "ReGrade unreachable, not gating this run. $REGRADE_API_URL did not answer or stopped answering, so this commit was not fully compared with the baseline and the pull request is not blocked" \
+                "the replay step log on this run page"
+              if [ "$REGRADE_FAIL_ON_DELTAS" = "true" ]; then
+                exit 0
+              fi
+              exit 1
+              ;;
+            *)
+              regrade_replay_outcome failed
+              regrade_phase_done failed "the replay did not finish; nothing to analyze"
+              # Any other replay failure is a real one: the baseline exists and
+              # the comparison still did not happen.
+              regrade_verdict FAIL "The replay itself failed, so this commit was never compared with the baseline" \
+                "the replay step log on this run page"
+              exit 1
+              ;;
+          esac
+
+      - name: Publish replay summary
+        # Runs for a replay that completed, which is the only one that stored
+        # a run to read back. always() keeps it from being skipped by an
+        # earlier step's failure.
+        if: always() && steps.replay.outputs.outcome == 'completed'
+        shell: sh
+        run: |
+          set -eu
+          . /tmp/regrade-phase.sh
+          regrade_phase "2/2" "read back" "Asking the API what it stored for commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
+          # The replay step already printed its own delta breakdown, which is the
+          # part no list command can produce. This adds the API's view of the run.
+          # Branched on rather than swallowed, so an API error is reported as a
+          # failed read-back instead of [ok]. The output is kept on the run page
+          # either way, and the step still succeeds: the replay before it
+          # already decided the job. An empty listing is not a confirmation
+          # either: the replay tags its run with this commit, so the API's list
+          # left it out, or the replay failed before storing one.
+          if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" \
+            ${REGRADE_INPUT_SOURCE:+--tags source="$REGRADE_INPUT_SOURCE"} --limit 1 2>&1); then
+            if printf '%s\n' "$OUT" | grep -q '^0 replay(s) found'; then
+              READ_BACK=empty
+            else
+              READ_BACK=ok
             fi
-            # Any other replay failure is a real one: the baseline exists and
-            # the comparison still did not happen.
-            regrade_verdict FAIL "The replay itself failed, so this commit was never compared with the baseline" \
-              "the replay step log on this run page"
-            exit 1
+          else
+            READ_BACK=failed
+          fi
+          echo "$OUT"
+          # shellcheck disable=SC2016  # the backticks are a literal markdown fence
+          printf '### ReGrade replay\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$READ_BACK" = ok ]; then
+            regrade_phase_done ok "the API's view of the run is on this run page"
+          elif [ "$READ_BACK" = empty ]; then
+            regrade_phase_done failed "the API listed no replay tagged commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}, so this job cannot confirm what is stored; the replay itself already finished, so the analysis still runs"
+          else
+            regrade_phase_done failed "the API did not answer; its error is on this run page, and the replay itself already finished, so the analysis still runs"
+          fi
+
+  # Analyze on pull requests
+  #
+  # LLM classification (optional, opt-in):
+  #   When enable-llm is true and llm-api-key is set, the analyze step sends API
+  #   response diff summaries to the configured LLM provider for classification.
+  #   Sensitive field values are redacted automatically, but response structure
+  #   and non-sensitive content are visible to the LLM provider.
+  regrade-analyze:
+    needs: regrade-replay
+    # Only a replay that completed has deltas to judge. Any other outcome
+    # (no baseline, an API that did not answer, a failed replay) was already
+    # reported by the replay job, and running analyze anyway would report the
+    # absence of a replay as a failed analysis. An analysis that is skipped
+    # never fails the workflow.
+    if: github.event_name == 'pull_request' && needs.regrade-replay.outputs.outcome == 'completed'
+    runs-on: ubuntu-latest
+    # Gate off keeps today's behavior: nothing here can fail the workflow.
+    # Gate on lets the analyze step decide, which it does by exit code.
+    continue-on-error: ${{ inputs.fail-on-deltas != true }}
+    container:
+      image: alpine:latest
+    env:
+      REGRADE_API_URL: ${{ inputs.api-url }}
+      REGRADE_API_KEY: ${{ secrets.regrade-api-key }}
+      REGRADE_PROFILE: ${{ inputs.profile }}
+      REGRADE_ENABLE_LLM: ${{ inputs.enable-llm }}
+      REGRADE_FAIL_ON_DELTAS: ${{ inputs.fail-on-deltas }}
+      REGRADE_INPUT_SOURCE: ${{ inputs.source }}
+      LLM_API_KEY: ${{ secrets.llm-api-key }}
+      # GitHub-native context the analyze script reads for PR comment posting
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      # As in the replay job: git must be on the PATH before the checkout, or
+      # the checkout has no .git, and the workspace must be marked safe for the
+      # steps that run git afterwards.
+      - name: Install git for the checkout
+        shell: sh
+        run: |
+          apk add --no-cache git
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # analyze compares deltas against the code that changed, so it needs the
+      # repository and its history, not just the working tree.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install analyze script
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache curl ca-certificates python3 py3-pip git
+          curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze" -o /usr/local/bin/regrade-analyze
+          # Published .sha256 files reference versioned filenames; reconstruct
+          # the line against the local path before sha256sum -c.
+          ANALYZE_HASH=$(curl -fsSL "${{ inputs.downloads-url }}/regrade-analyze.sha256" | awk '{print $1}')
+          printf '%s  /usr/local/bin/regrade-analyze\n' "$ANALYZE_HASH" | sha256sum -c -
+          chmod +x /usr/local/bin/regrade-analyze
+
+          # Phase reporting, written to a file because each step gets its own
+          # shell. The same helpers the replay job writes.
+          printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
+          pip install --break-system-packages --quiet \
+            'requests>=2.31,<3' 'httpx>=0.27,<1' 'mcp>=1.27,<2'
+          if [ "${{ inputs.enable-llm }}" = "true" ]; then
+            pip install --break-system-packages --quiet \
+              'anthropic>=0.40,<1' 'openai>=1.0,<2' 'google-genai>=2,<3'
           fi
 
       - name: Classify deltas and post PR comment
-        # Skipped when the replay found no baseline or the API did not answer:
-        # there is no replay to judge, and running analyze anyway would report
-        # its absence as a failed analysis.
-        if: env.REGRADE_NO_BASELINE != '1' && env.REGRADE_API_UNREACHABLE != '1'
         shell: sh
         run: |
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
-          regrade_phase "2/3" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
+          regrade_phase "1/1" "analyze" "Sorting the deltas into noise and things needing a human decision, and posting the summary to the pull request"
           set +e
           # The replay's source picks this job's replay among those tagged with
           # this commit, and its own pull request comment.
@@ -752,41 +835,3 @@ jobs:
               ;;
           esac
           exit 0
-
-      - name: Publish replay summary
-        # Skipped when the API did not answer or there was no baseline: the
-        # replay step already said so, and nothing was stored to read back.
-        if: always() && env.REGRADE_API_UNREACHABLE != '1' && env.REGRADE_NO_BASELINE != '1'
-        shell: sh
-        run: |
-          set -eu
-          . /tmp/regrade-phase.sh
-          regrade_phase "3/3" "read back" "Asking the API what it stored for commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
-          # The replay step already printed its own delta breakdown, which is the
-          # part no list command can produce. This adds the API's view of the run.
-          # Branched on rather than swallowed, so an API error is reported as a
-          # failed read-back instead of [ok]. The output is kept on the run page
-          # either way, and the step still succeeds: the analysis before it
-          # already decided the job. An empty listing is not a confirmation
-          # either: the replay tags its run with this commit, so the API's list
-          # left it out, or the replay failed before storing one.
-          if OUT=$(NO_COLOR=1 regrade replays list --tags commit="$GITHUB_SHA" \
-            ${REGRADE_INPUT_SOURCE:+--tags source="$REGRADE_INPUT_SOURCE"} --limit 1 2>&1); then
-            if printf '%s\n' "$OUT" | grep -q '^0 replay(s) found'; then
-              READ_BACK=empty
-            else
-              READ_BACK=ok
-            fi
-          else
-            READ_BACK=failed
-          fi
-          echo "$OUT"
-          # shellcheck disable=SC2016  # the backticks are a literal markdown fence
-          printf '### ReGrade replay\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$READ_BACK" = ok ]; then
-            regrade_phase_done ok "the API's view of the run is on this run page"
-          elif [ "$READ_BACK" = empty ]; then
-            regrade_phase_done failed "the API listed no replay tagged commit=$GITHUB_SHA${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}, so this job cannot confirm what is stored; the analysis above is unaffected"
-          else
-            regrade_phase_done failed "the API did not answer; its error is on this run page, and the analysis above is unaffected"
-          fi
