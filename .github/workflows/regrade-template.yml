@@ -87,7 +87,7 @@ on:
         type: boolean
         default: false
       llm-model:
-        description: "Model the analysis asks (LLM_MODEL). Empty uses claude-sonnet-4-20250514. Without llm-base-url its prefix picks the provider: claude, gpt-/o1-/o3-/o4-/chatgpt-, or gemini."
+        description: "Model the analysis asks (LLM_MODEL). Empty uses claude-sonnet-5-5. Without llm-base-url its prefix picks the provider: claude, gpt-/o1-/o3-/o4-/chatgpt-, or gemini."
         required: false
         type: string
         default: ""
@@ -875,7 +875,7 @@ jobs:
   #   name, and llm-api-key is optional (set it if the server wants a bearer
   #   token).
   #
-  #   Without llm-base-url, llm-model (default claude-sonnet-4-20250514) picks
+  #   Without llm-base-url, llm-model (default claude-sonnet-5-5) picks
   #   the provider by prefix: claude (Anthropic), gpt-/o1-/o3-/o4-/chatgpt-
   #   (OpenAI) or gemini (Google). anthropic-base-url, openai-base-url and
   #   google-gemini-base-url send those requests through your own gateway.
