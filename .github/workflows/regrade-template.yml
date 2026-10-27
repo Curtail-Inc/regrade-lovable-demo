@@ -19,6 +19,7 @@
 #       uses: ./.github/workflows/regrade-template.yml
 #       with:
 #         app-image: ghcr.io/your-org/your-app:${{ github.sha }}
+#         app-image-is-merge-result: true   # github.sha is the merge commit; drop this if you build the PR head
 #         app-port: '8080'
 #         test-command: 'sh tests.sh'
 #         profile: my-profile
@@ -42,6 +43,11 @@ on:
         description: "Docker image of application under test (must be pullable from the runner)"
         required: true
         type: string
+      app-image-is-merge-result:
+        description: "Set true when app-image is built from the pull request's merge commit (github.sha, which the default checkout and the usage example at the top of the file use). The replay then compares with the base commit that merge was built on. Leave false when app-image is built from the pull request head, which compares with the branch point."
+        required: false
+        type: boolean
+        default: false
       job-image:
         description: "Image the record job runs in, which is where test-command executes. Override when your suite needs more than busybox (bash, node, python). Must be able to run test-command."
         required: false
@@ -80,6 +86,46 @@ on:
         required: false
         type: boolean
         default: false
+      llm-model:
+        description: "Model the analysis asks (LLM_MODEL). Empty uses claude-sonnet-4-20250514. Without llm-base-url its prefix picks the provider: claude, gpt-/o1-/o3-/o4-/chatgpt-, or gemini."
+        required: false
+        type: string
+        default: ""
+      llm-base-url:
+        description: "OpenAI-compatible server every LLM request goes to, such as a locally hosted Ollama or vLLM, including its /v1 (LLM_BASE_URL). Set llm-model to a name it serves. Inputs show in the run log, so put no credentials in the URL; a bearer token goes in the llm-api-key secret."
+        required: false
+        type: string
+        default: ""
+      anthropic-base-url:
+        description: "Gateway or proxy for Anthropic requests (ANTHROPIC_BASE_URL)."
+        required: false
+        type: string
+        default: ""
+      openai-base-url:
+        description: "Gateway or proxy for OpenAI requests (OPENAI_BASE_URL)."
+        required: false
+        type: string
+        default: ""
+      openai-org-id:
+        description: "Sent as the OpenAI-Organization header to any OpenAI-compatible server (OPENAI_ORG_ID)."
+        required: false
+        type: string
+        default: ""
+      openai-project-id:
+        description: "Sent as the OpenAI-Project header to any OpenAI-compatible server (OPENAI_PROJECT_ID)."
+        required: false
+        type: string
+        default: ""
+      google-gemini-base-url:
+        description: "Gateway or proxy for Gemini requests (GOOGLE_GEMINI_BASE_URL)."
+        required: false
+        type: string
+        default: ""
+      api-timeout-seconds:
+        description: "Timeout in seconds for one exchange between the analysis and the ReGrade API, retries included (REGRADE_MCP_TIMEOUT_S). Empty uses 120."
+        required: false
+        type: string
+        default: ""
       fail-on-deltas:
         description: "Fail the workflow when any delta still needs a human decision (unlabeled, suspicious status change, or security finding). An analysis that could not run, or a ReGrade API that does not answer, is reported as a warning and does not block."
         required: false
@@ -153,7 +199,7 @@ env:
         unreadable)
           regrade_verdict WARN "Nothing ReGrade read needs a human decision, but $1 could not be read, so whether the whole delta list was read is unknown. The ReGrade comment and the analyze log say what was read" "$2" ;;
         *)
-          regrade_verdict PASS "Every difference from the baseline was explained by the profile" "$2" ;;
+          regrade_verdict PASS "Every difference from the baseline was explained by the profile or, with enable-llm, by the LLM classification listed in the comment" "$2" ;;
       esac
     }
     regrade_check_inputs() {  # the source and team-id inputs, before the sensor starts
@@ -532,6 +578,7 @@ jobs:
       # The replay finds the branch point from these two (see the replay step).
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REGRADE_APP_IMAGE_IS_MERGE_RESULT: ${{ inputs.app-image-is-merge-result }}
       # Tags the replay mr=<number>, so the project health view can match it
       # to the recording of the pull request once it is merged.
       GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -585,7 +632,44 @@ jobs:
           . /tmp/regrade-phase.sh
           mkdir -p regrade-summary
           regrade_check_inputs
-          regrade_phase "1/2" "replay" "Re-sending the $REGRADE_BASELINE_BRANCH recording${GITHUB_BASE_SHA:+ made at the branch point of this pull request (or the newest)}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          # Which commit's recording is the baseline. This workflow's checkout
+          # is the merge ref on every pull_request run, so git cannot say what
+          # the caller built app-image from: the caller says so with
+          # app-image-is-merge-result. When it is true, the baseline is the
+          # merge commit's first parent, the base branch commit the merge was
+          # built on, provided HEAD really is the merge of the pull request's
+          # head (two parents, the second being the head). pull_request.base.sha
+          # is the base branch's tip when the event fired, which may be newer
+          # than that commit, so it is not used for this. Otherwise the baseline
+          # is the branch point.
+          BASELINE_SHA=""
+          BASELINE_NAME=""
+          PHASE_BASELINE=""
+          MERGE_REF_WARNING=""
+          if [ "${REGRADE_APP_IMAGE_IS_MERGE_RESULT:-false}" = true ]; then
+            if [ -n "${GITHUB_HEAD_SHA:-}" ] \
+              && [ "$(git rev-list --parents -n 1 HEAD 2>/dev/null | wc -w)" -eq 3 ] \
+              && [ "$(git rev-parse HEAD^2 2>/dev/null)" = "$GITHUB_HEAD_SHA" ]; then
+              BASELINE_SHA=$(git rev-parse HEAD^1)
+              BASELINE_NAME="the base commit this merge was built on"
+              PHASE_BASELINE="the base commit the merge of this pull request was built on"
+            else
+              MERGE_REF_WARNING="WARNING: app-image-is-merge-result is true, but the checkout is not the merge commit of this pull request; using the branch point instead"
+            fi
+          fi
+          if [ -z "$BASELINE_SHA" ] && [ -n "${GITHUB_BASE_SHA:-}" ]; then
+            # The branch point is the merge base of the base tip and the head,
+            # read from the full history the checkout above fetches.
+            if BASELINE_SHA=$(git merge-base "$GITHUB_BASE_SHA" "${GITHUB_HEAD_SHA:-HEAD}"); then
+              BASELINE_NAME="the branch point"
+              PHASE_BASELINE="the branch point of this pull request"
+            else
+              BASELINE_SHA=""
+              MERGE_REF_WARNING="$MERGE_REF_WARNING WARNING: could not find where this pull request branched from $GITHUB_BASE_SHA in the checkout; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead"
+            fi
+          fi
+          regrade_phase "1/2" "replay" "Re-sending the $REGRADE_BASELINE_BRANCH recording${PHASE_BASELINE:+ made at $PHASE_BASELINE (or the newest)}${REGRADE_INPUT_SOURCE:+ from source $REGRADE_INPUT_SOURCE} against http://app-under-test:${{ inputs.app-port }}${REGRADE_PROFILE:+ through profile $REGRADE_PROFILE}, to compare this commit's responses with the baseline"
+          [ -z "$MERGE_REF_WARNING" ] || echo "$MERGE_REF_WARNING"
           # The outcome of this replay, for the analysis job. It is written
           # exactly once, by the branch below that the replay's exit status
           # takes, because a step output written twice depends on which write
@@ -639,27 +723,37 @@ jobs:
             cat regrade-summary/replay-output.txt
             return "$regrade_replay_status"
           }
-          # A pull request replays the recording of the commit it branched
-          # from (the sensor tags each recording with git_sha): the newest
-          # recording can hold changes this branch does not have, and every
-          # delta those changes cause would be reported against it.
-          # pull_request.base.sha is the base branch's tip when the event
-          # fired, so the branch point is the merge base of it and the head,
-          # read from the full history the checkout above fetches. When that
-          # commit has no recording (status 66), the newest is used and the
-          # log says so. The status of the last replay run is the one that
-          # decides the job.
+          # Says which baseline this run chose, in the log and on the run page.
+          regrade_baseline_note() {
+            echo "Baseline: $1"
+            printf '### ReGrade baseline\n\n%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+          # A pull request replays the recording of the commit its code was
+          # built on (the sensor tags each recording with git_sha): the newest
+          # recording can hold changes this build does not have, and every
+          # delta those changes cause would be reported against it. With
+          # app-image-is-merge-result true that commit is the merge's first
+          # parent. Otherwise it is the branch point, which cannot see what the
+          # base branch gained after it. When that commit has no recording (status
+          # 66), the newest is used and the log says so. The status of the
+          # last replay run is the one that decides the job.
           REPLAY_STATUS=0
-          BRANCH_POINT=""
-          if [ -n "${GITHUB_BASE_SHA:-}" ]; then
-            BRANCH_POINT=$(git merge-base "$GITHUB_BASE_SHA" "${GITHUB_HEAD_SHA:-HEAD}") || \
-              echo "WARNING: could not find where this pull request branched from $GITHUB_BASE_SHA in the checkout; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead"
+          if [ -n "$BASELINE_SHA" ] && [ "$BASELINE_NAME" = "the branch point" ]; then
+            ADVICE=""
+            if [ "${REGRADE_APP_IMAGE_IS_MERGE_RESULT:-false}" != true ]; then
+              ADVICE=" To replay the merge instead, build app-image from github.sha (the pull request's merge commit) and set app-image-is-merge-result: true."
+            fi
+            regrade_baseline_note "the recording of the branch point $BASELINE_SHA. This is the weaker check: it cannot see breakage of changes that landed on $REGRADE_BASELINE_BRANCH after the branch point.${ADVICE}"
+          elif [ -n "$BASELINE_SHA" ]; then
+            regrade_baseline_note "the recording of $BASELINE_NAME, $BASELINE_SHA"
+          else
+            regrade_baseline_note "the newest $REGRADE_BASELINE_BRANCH recording"
           fi
-          if [ -n "$BRANCH_POINT" ]; then
-            regrade_replay --tag git_sha="$BRANCH_POINT" || REPLAY_STATUS=$?
+          if [ -n "$BASELINE_SHA" ]; then
+            regrade_replay --tag git_sha="$BASELINE_SHA" || REPLAY_STATUS=$?
             case "$REPLAY_STATUS" in
               66)
-                echo "WARNING: no recording of the branch point $BRANCH_POINT; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead, which may include changes this branch does not have"
+                echo "WARNING: no recording of $BASELINE_NAME $BASELINE_SHA; comparing with the newest $REGRADE_BASELINE_BRANCH recording instead, which may include changes this build does not have"
                 REPLAY_STATUS=0
                 regrade_replay || REPLAY_STATUS=$?
                 ;;
@@ -767,34 +861,29 @@ jobs:
   # Analyze on pull requests
   #
   # LLM classification (optional, opt-in):
-  #   When enable-llm is true and llm-api-key or LLM_BASE_URL is set, the
+  #   When enable-llm is true and llm-api-key or llm-base-url is set, the
   #   analyze step sends API response diff summaries to an LLM for
   #   classification.
   #   Sensitive field values are redacted automatically, but response structure
   #   and non-sensitive content are visible to the LLM provider.
   #
-  #   A called workflow passes on only the inputs and secrets it declares, so
-  #   the variables below reach regrade-analyze only when you add them to this
-  #   job's env: block in your copy of this file, for example
-  #   LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}.
-  #
   #   A locally hosted model keeps that data in your network. Run an
-  #   OpenAI-compatible server such as Ollama or vLLM and set:
-  #     LLM_BASE_URL=http://ollama.internal.example.com:11434/v1
-  #     LLM_MODEL=llama3.1:8b   (a model name your server serves)
-  #   With LLM_BASE_URL set, every LLM request goes there whatever the model
+  #   OpenAI-compatible server such as Ollama or vLLM and pass:
+  #     llm-base-url: http://ollama.internal.example.com:11434/v1
+  #     llm-model: llama3.1:8b   (a model name your server serves)
+  #   With llm-base-url set, every LLM request goes there whatever the model
   #   name, and llm-api-key is optional (set it if the server wants a bearer
   #   token).
   #
-  #   Without LLM_BASE_URL, LLM_MODEL (default claude-sonnet-4-20250514) picks
+  #   Without llm-base-url, llm-model (default claude-sonnet-4-20250514) picks
   #   the provider by prefix: claude (Anthropic), gpt-/o1-/o3-/o4-/chatgpt-
-  #   (OpenAI) or gemini (Google). ANTHROPIC_BASE_URL, OPENAI_BASE_URL and
-  #   GOOGLE_GEMINI_BASE_URL send those requests through your own gateway;
-  #   When set, OPENAI_ORG_ID and OPENAI_PROJECT_ID go out as headers on every
-  #   request to an OpenAI-compatible server: OpenAI, an OPENAI_BASE_URL gateway
-  #   or the LLM_BASE_URL server.
+  #   (OpenAI) or gemini (Google). anthropic-base-url, openai-base-url and
+  #   google-gemini-base-url send those requests through your own gateway.
+  #   When set, openai-org-id and openai-project-id go out as headers on every
+  #   request to an OpenAI-compatible server: OpenAI, an openai-base-url
+  #   gateway or the llm-base-url server.
   #
-  #   REGRADE_MCP_TIMEOUT_S is the request timeout, in seconds, for one ReGrade
+  #   api-timeout-seconds is the request timeout, in seconds, for one ReGrade
   #   API exchange (default 120). It covers that exchange's retries, which
   #   wait 2, 4 and 8 seconds, so a value below about 15 seconds cuts the
   #   retries short.
@@ -820,6 +909,15 @@ jobs:
       REGRADE_FAIL_ON_DELTAS: ${{ inputs.fail-on-deltas }}
       REGRADE_INPUT_SOURCE: ${{ inputs.source }}
       LLM_API_KEY: ${{ secrets.llm-api-key }}
+      # regrade-analyze treats each of these as unset when it is empty.
+      LLM_MODEL: ${{ inputs.llm-model }}
+      LLM_BASE_URL: ${{ inputs.llm-base-url }}
+      ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+      OPENAI_BASE_URL: ${{ inputs.openai-base-url }}
+      OPENAI_ORG_ID: ${{ inputs.openai-org-id }}
+      OPENAI_PROJECT_ID: ${{ inputs.openai-project-id }}
+      GOOGLE_GEMINI_BASE_URL: ${{ inputs.google-gemini-base-url }}
+      REGRADE_MCP_TIMEOUT_S: ${{ inputs.api-timeout-seconds }}
       # GitHub-native context regrade-analyze reads for PR comment posting
       GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}

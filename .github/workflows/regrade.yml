@@ -61,6 +61,10 @@ jobs:
     with:
       app-image: ${{ needs.build-app.outputs.image }}
       app-port: "8080"
+      # build-app checks out the default ref, which on a pull request is the
+      # merge commit (github.sha), so the image is the merge result and the
+      # replay compares it with the base commit that merge was built on.
+      app-image-is-merge-result: true
       # sh, not bash: the template runs the test command inside its own job
       # container, which is Alpine and has no bash. tests.sh is POSIX-clean
       # (shellcheck -s sh passes), so it runs unchanged.
