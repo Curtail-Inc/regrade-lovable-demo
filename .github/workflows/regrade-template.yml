@@ -13,7 +13,7 @@
 #     pull_request:
 #   permissions:
 #     contents: read
-#     pull-requests: write   # required for the analysis job to post its comment
+#     pull-requests: write   # the analysis job posts its comment; the record job reads the merged pull request
 #   jobs:
 #     regrade:
 #       uses: ./.github/workflows/regrade-template.yml
@@ -209,10 +209,18 @@ jobs:
       REGRADE_INPUT_SOURCE: ${{ inputs.source }}
       REGRADE_INPUT_TEAM_ID: ${{ inputs.team-id }}
       REGRADE_TEST_SECRET: ${{ secrets.test-secret }}
+      # For the lookup of the pull request this commit was merged from. The
+      # token for it is not here: every step of the job, the caller's test
+      # command included, would inherit it.
+      REGRADE_BASELINE_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       # GitLab clones the repository for a job; GitHub does not. Without this
-      # the caller's test command has nothing to run against.
+      # the caller's test command has nothing to run against. That command
+      # runs in this checkout and needs no git credentials, so the workflow
+      # token is not left in .git/config.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install ReGrade sensor
         shell: sh
         run: |
@@ -240,6 +248,71 @@ jobs:
           # capture and replay steps run before they start the sensor.
           printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
 
+      # The pull request this commit was merged from, which the recording
+      # carries as merged_mr for the project health view: the view finds the
+      # most recently merged pull request here, then the replays tagged mr with
+      # the same number. The sensor fixes a recording's tags when it starts, so
+      # the lookup is the step before it. It is a step of its own so that the
+      # token is in its environment alone and not in the test command's. It
+      # never fails the job: a recording without the tag is only missing from
+      # the health view.
+      - name: Find the merged pull request
+        shell: sh
+        continue-on-error: true
+        env:
+          REGRADE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          regrade_find_merged_pr() {
+            if [ -z "${REGRADE_GITHUB_TOKEN:-}" ]; then
+              REGRADE_MERGED_MR_WHY="the workflow has no GitHub token"
+              return 1
+            fi
+            # The install is time limited where `timeout` exists, so a runner
+            # with no route to its package mirror cannot stall the job.
+            REGRADE_INSTALL_LIMIT=""
+            ! command -v timeout >/dev/null 2>&1 || REGRADE_INSTALL_LIMIT="timeout 60"
+            command -v jq >/dev/null 2>&1 || \
+              (command -v apk >/dev/null 2>&1 && $REGRADE_INSTALL_LIMIT apk add --no-cache jq >/dev/null 2>&1) || \
+              (command -v apt-get >/dev/null 2>&1 && $REGRADE_INSTALL_LIMIT apt-get update -qq >/dev/null 2>&1 && $REGRADE_INSTALL_LIMIT apt-get install -y -qq jq >/dev/null 2>&1) || \
+              { REGRADE_MERGED_MR_WHY="jq is missing and could not be installed; add jq to job-image"; return 1; }
+            # curl exits 22 for an HTTP error status (a token without the
+            # permission, a rate limit, a failing server), and anything else for a
+            # request that never got an answer.
+            REGRADE_MERGED_MR_CURL=0
+            REGRADE_MERGED_MR_RESPONSE=$(curl -sS -f --max-time 10 \
+              -H "Authorization: Bearer $REGRADE_GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" 2>/dev/null) || REGRADE_MERGED_MR_CURL=$?
+            if [ "$REGRADE_MERGED_MR_CURL" = 22 ]; then
+              REGRADE_MERGED_MR_WHY="GitHub answered the lookup with an HTTP error (check that the caller's permissions include pull-requests: write, or GitHub was failing)"
+              return 1
+            elif [ "$REGRADE_MERGED_MR_CURL" != 0 ]; then
+              REGRADE_MERGED_MR_WHY="the GitHub API could not be reached (curl exit $REGRADE_MERGED_MR_CURL)"
+              return 1
+            fi
+            # The pull request that produced this commit when GitHub names
+            # one, else the first merged into the default branch.
+            REGRADE_MERGED_MR=$(printf '%s' "$REGRADE_MERGED_MR_RESPONSE" | jq -r \
+              --arg sha "$GITHUB_SHA" --arg branch "$REGRADE_BASELINE_BRANCH" '
+                [.[] | select(.merged_at != null and .base.ref == $branch)]
+                | (map(select(.merge_commit_sha == $sha)) + .)
+                | .[0].number // empty' 2>/dev/null) || {
+              REGRADE_MERGED_MR_WHY="the GitHub API answered with something that is not a list of pull requests"
+              return 1
+            }
+            case "$REGRADE_MERGED_MR" in
+              ''|*[!0-9]*)
+                REGRADE_MERGED_MR=""
+                REGRADE_MERGED_MR_WHY="GitHub names no merged pull request for commit $GITHUB_SHA (a direct push has none)"
+                return 1 ;;
+            esac
+          }
+          REGRADE_MERGED_MR=""
+          regrade_find_merged_pr || echo "WARNING: this recording is not tagged merged_mr because $REGRADE_MERGED_MR_WHY. This project will not show a health status on the project health dashboard until a default-branch recording finds its pull request. Recording continues."
+          # Handed to the record step, which has no token.
+          [ -z "$REGRADE_MERGED_MR" ] || printf 'REGRADE_MERGED_MR=%s\n' "$REGRADE_MERGED_MR" >> "$GITHUB_ENV"
+
       - name: Record baseline traffic
         shell: sh
         run: |
@@ -257,6 +330,7 @@ jobs:
             --tag project="$GITHUB_REPOSITORY" \
             --tag git_branch="${GITHUB_REF#refs/heads/}" \
             ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
+            ${REGRADE_MERGED_MR:+--tag merged_mr="$REGRADE_MERGED_MR"} \
             ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} &
           PROXY_PID=$!
 
@@ -458,6 +532,9 @@ jobs:
       # The replay finds the branch point from these two (see the replay step).
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Tags the replay mr=<number>, so the project health view can match it
+      # to the recording of the pull request once it is merged.
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       # actions/checkout clones only when git is on the PATH, and this
       # container has none until a step adds it. Without git it downloads a
@@ -472,10 +549,13 @@ jobs:
           apk add --no-cache git
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       # The replay reads the history only to find the commit the pull request
-      # branched from.
+      # branched from. Nothing later fetches from the remote, and the
+      # caller's commands run in this checkout, so the workflow token is not
+      # left in .git/config.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install ReGrade sensor
         shell: sh
         run: |
@@ -553,6 +633,7 @@ jobs:
               --replay-tag commit="$GITHUB_SHA" \
               --replay-tag pipeline="$GITHUB_RUN_ID" \
               ${REGRADE_INPUT_SOURCE:+--replay-tag source="$REGRADE_INPUT_SOURCE"} \
+              ${GITHUB_PR_NUMBER:+--replay-tag mr="$GITHUB_PR_NUMBER"} \
               ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} \
               --quiet > regrade-summary/replay-output.txt 2>&1 || regrade_replay_status=$?
             cat regrade-summary/replay-output.txt
