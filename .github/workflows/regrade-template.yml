@@ -365,6 +365,13 @@ jobs:
           set -eu
           . /tmp/regrade-phase.sh
           regrade_check_inputs
+          # Who merged: on a push to the default branch the actor is whoever
+          # pushed or merged. Scheduled and manual runs have an actor who
+          # merged nothing.
+          REGRADE_MERGED_BY=""
+          [ "${GITHUB_EVENT_NAME:-}" != push ] || REGRADE_MERGED_BY="${GITHUB_ACTOR:-}"
+          # A merge queue or an app pushes on behalf of a person it does not name.
+          case "$REGRADE_MERGED_BY" in *"[bot]") REGRADE_MERGED_BY="" ;; esac
           regrade_phase "1/2" "capture" "Recording every request the test suite makes, through the proxy on port 8888 to http://app-under-test:${{ inputs.app-port }}, tagged pipeline=$GITHUB_RUN_ID${REGRADE_INPUT_SOURCE:+ and source=$REGRADE_INPUT_SOURCE}"
           regrade proxy \
             --target http://app-under-test:${{ inputs.app-port }} \
@@ -377,6 +384,8 @@ jobs:
             --tag git_branch="${GITHUB_REF#refs/heads/}" \
             ${REGRADE_INPUT_SOURCE:+--tag source="$REGRADE_INPUT_SOURCE"} \
             ${REGRADE_MERGED_MR:+--tag merged_mr="$REGRADE_MERGED_MR"} \
+            ${REGRADE_MERGED_BY:+--tag merged_by="$REGRADE_MERGED_BY"} \
+            ${GITHUB_SERVER_URL:+--tag project_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"} \
             ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} &
           PROXY_PID=$!
 
@@ -582,6 +591,12 @@ jobs:
       # Tags the replay mr=<number>, so the project health view can match it
       # to the recording of the pull request once it is merged.
       GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+      # The author and title tag the replay too, so the project drill-down can
+      # group pull requests by person. They pass through the environment and
+      # never into the script text: a title is typed by the author, and one
+      # interpolated into a script would be executed.
+      GITHUB_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      GITHUB_PR_TITLE: ${{ github.event.pull_request.title }}
     steps:
       # actions/checkout clones only when git is on the PATH, and this
       # container has none until a step adds it. Without git it downloads a
@@ -607,7 +622,7 @@ jobs:
         shell: sh
         run: |
           set -eu
-          apk add --no-cache curl ca-certificates
+          apk add --no-cache curl ca-certificates jq
           curl -fsSL "${{ inputs.downloads-url }}/regrade-linux-x86_64" -o /usr/local/bin/regrade
           # Published .sha256 files reference versioned filenames; reconstruct
           # the line against the local path before sha256sum -c.
@@ -623,6 +638,66 @@ jobs:
           # also holds the check of the source and team-id inputs, which the
           # capture and replay steps run before they start the sensor.
           printf '%s\n' "$REGRADE_PHASE_SH" > /tmp/regrade-phase.sh
+
+      # The pull request author's email, which the replay carries as
+      # mr_author_email. The event names the author's login but not the email;
+      # the head commit has it, and it is the author's only when the commit's
+      # GitHub account is the pull request's author. It is a step of its own so
+      # that the token is in its environment alone, and it never fails the job:
+      # a replay without the email only lacks a mailto link on the dashboard.
+      - name: Find the pull request author
+        shell: sh
+        continue-on-error: true
+        env:
+          REGRADE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          regrade_find_author_email() {
+            if [ -z "${REGRADE_GITHUB_TOKEN:-}" ]; then
+              REGRADE_AUTHOR_WHY="the workflow has no GitHub token"
+              return 1
+            fi
+            # The install step adds jq to this job's image.
+            command -v jq >/dev/null 2>&1 || {
+              REGRADE_AUTHOR_WHY="jq is missing from the replay job's image"
+              return 1
+            }
+            # curl exits 22 for an HTTP error status (a token without the
+            # permission, a rate limit, a failing server), and anything else for a
+            # request that never got an answer.
+            REGRADE_AUTHOR_CURL=0
+            REGRADE_AUTHOR_RESPONSE=$(curl -sS -f --max-time 10 \
+              -H "Authorization: Bearer $REGRADE_GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$GITHUB_HEAD_SHA" 2>/dev/null) || REGRADE_AUTHOR_CURL=$?
+            if [ "$REGRADE_AUTHOR_CURL" = 22 ]; then
+              REGRADE_AUTHOR_WHY="GitHub answered the lookup with an HTTP error (check that the token can read the repository's commits, or GitHub was failing)"
+              return 1
+            elif [ "$REGRADE_AUTHOR_CURL" != 0 ]; then
+              REGRADE_AUTHOR_WHY="the GitHub API could not be reached (curl exit $REGRADE_AUTHOR_CURL)"
+              return 1
+            fi
+            # Logins compare in lower case. A commit with no GitHub account
+            # has a null author, which matches nobody.
+            REGRADE_AUTHOR_EMAIL=$(printf '%s' "$REGRADE_AUTHOR_RESPONSE" | jq -r --arg login "$GITHUB_PR_AUTHOR" '
+                if type != "object" then error("not a commit") else . end
+                | select((.author.login // "" | ascii_downcase) == ($login | ascii_downcase))
+                | .commit.author.email // empty' 2>/dev/null) || {
+              REGRADE_AUTHOR_WHY="the GitHub API answered with something that is not a commit"
+              return 1
+            }
+          }
+          REGRADE_AUTHOR_EMAIL=""
+          if [ -n "${GITHUB_PR_AUTHOR:-}" ]; then
+            regrade_find_author_email || echo "WARNING: the pull request author's email could not be looked up because $REGRADE_AUTHOR_WHY. Replay continues."
+          fi
+          # Handed to the replay step, which has no token. $GITHUB_ENV takes one
+          # variable per line, so an address with whitespace in it is dropped
+          # rather than allowed to start a second variable.
+          case "$REGRADE_AUTHOR_EMAIL" in
+            ''|*[[:space:]]*) ;;
+            *) printf 'REGRADE_AUTHOR_EMAIL=%s\n' "$REGRADE_AUTHOR_EMAIL" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: Replay recorded baseline against PR head
         id: replay
@@ -716,8 +791,14 @@ jobs:
               ${REGRADE_PROFILE:+--profile "$REGRADE_PROFILE"} \
               --replay-tag commit="$GITHUB_SHA" \
               --replay-tag pipeline="$GITHUB_RUN_ID" \
+              --replay-tag project="$GITHUB_REPOSITORY" \
               ${REGRADE_INPUT_SOURCE:+--replay-tag source="$REGRADE_INPUT_SOURCE"} \
               ${GITHUB_PR_NUMBER:+--replay-tag mr="$GITHUB_PR_NUMBER"} \
+              ${GITHUB_PR_AUTHOR:+--replay-tag mr_author="$GITHUB_PR_AUTHOR"} \
+              ${REGRADE_AUTHOR_EMAIL:+--replay-tag mr_author_email="$REGRADE_AUTHOR_EMAIL"} \
+              ${GITHUB_PR_TITLE:+--replay-tag mr_title="$GITHUB_PR_TITLE"} \
+              ${GITHUB_PR_AUTHOR:+--replay-tag mr_author_source=api} \
+              ${GITHUB_PR_NUMBER:+--replay-tag mr_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$GITHUB_PR_NUMBER"} \
               ${REGRADE_INPUT_TEAM_ID:+--team-id "$REGRADE_INPUT_TEAM_ID"} \
               --quiet > regrade-summary/replay-output.txt 2>&1 || regrade_replay_status=$?
             cat regrade-summary/replay-output.txt
